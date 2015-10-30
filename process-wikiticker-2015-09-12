@@ -1,0 +1,46 @@
+#!/bin/bash -eu
+
+# Force this to the working directory
+cd "$(dirname "$0")"
+
+gzcat wikiticker-2015-09-12.gz \
+  | jq -c '
+    select("2015-09-12" < .timestamp and .timestamp < "2015-09-13") |
+    {
+      time: .timestamp | sub("\\.[0-9]{3}"; ""),
+      dayQuarter: ((.timestamp | sub("\\.[0-9]{3}"; "") | fromdateiso8601 | strftime("%H") | tonumber) / 6) | floor,
+      channel,
+      cityName,
+      comment,
+      countryIsoCode,
+      countryName,
+      isAnonymous: (.countryName != null),
+      isMinor,
+      isNew,
+      isRobot,
+      isUnpatrolled,
+      metroCode,
+      namespace,
+      page,
+      regionIsoCode,
+      regionName,
+      user,
+      delta,
+      added: [.delta, 0] | max,
+      deleted: [-.delta, 0] | max
+    }' \
+  > wikiticker-2015-09-12-all.json
+
+perl -ne'print if $. % 10 == 0' wikiticker-2015-09-12-all.json \
+  > wikiticker-2015-09-12-sampled.json
+
+cat wikiticker-2015-09-12-all.json \
+  | jq -c 'select(.isAnonymous)' \
+  > wikiticker-2015-09-12-anonymous.json
+
+cat wikiticker-2015-09-12-anonymous.json \
+  | jq -c 'select(.countryName == "United States")' \
+  > wikiticker-2015-09-12-anonymous-usa.json
+
+
+
