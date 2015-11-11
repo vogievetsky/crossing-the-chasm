@@ -45,7 +45,7 @@ function translate(x, y) {
   return "translate(" + x + "," + y + ")";
 }
 
-var dayQuarters = ['midnight - 6am', '6am - noon', 'noon - 6pm', '6pm - midnight']
+var timeOfDayLabels = ['midnight - 6am', '6am - noon', 'noon - 6pm', '6pm - midnight']
 
 var margin = {top: 20, right: 20, bottom: 30, left: 40},
     width = 960 - margin.left - margin.right,
@@ -85,21 +85,24 @@ loadLineJson("wikiticker-2015-09-12-anonymous-usa.json", function(error, flatDat
   upgradeTime(flatData, 'time');
 
 
-  var stateByDayQuarter = $('wiki')
+  var stateByTimeOfDay = $('wiki')
     .filter('$regionName != null')
     .split('$regionName', 'State')
       .apply('Edits', '$wiki.count()')
       .sort('$Edits', 'descending')
       .limit(5)
-      .apply('DayQuarters',
-        $('wiki').split('$dayQuarter', 'DayQuarter')
+      .apply('TimesOfDay',
+        $('wiki').split('$dayQuarter', 'TimeOfDay')
           .apply('Edits', '$wiki.count()')
-          .sort('$DayQuarter', 'ascending')
+          .sort('$TimeOfDay', 'ascending')
       )
 
 
-  stateByDayQuarter.compute({ wiki: Dataset.fromJS(flatData) }).then(function(dataset) {
+  stateByTimeOfDay.compute({ wiki: Dataset.fromJS(flatData) }).then(function(dataset) {
     var data = dataset.toJS();
+
+    // Let's have a look at what we have here.
+    console.log(JSON.stringify(data, null, 2));
 
     var hours = [0, 1, 2, 3];
 
@@ -109,7 +112,7 @@ loadLineJson("wikiticker-2015-09-12-anonymous-usa.json", function(error, flatDat
     y.domain([
       0,
       d3.max(data, function(d) {
-        return d3.max(d.DayQuarters, function(d) { return d.Edits; });
+        return d3.max(d.TimesOfDay, function(d) { return d.Edits; });
       })
     ]);
 
@@ -140,17 +143,17 @@ loadLineJson("wikiticker-2015-09-12-anonymous-usa.json", function(error, flatDat
     states.exit().remove();
 
     // Within each <g> make a <rect> for the hours
-    var hoursOfDay = states.selectAll(".day-quarter")
-      .data(function(d) { return d.DayQuarters; }); // Split on day quarter
+    var hoursOfDay = states.selectAll(".time-of-day")
+      .data(function(d) { return d.TimesOfDay; }); // Split on day quarter
 
-    hoursOfDay.enter().append("rect").attr('class', 'day-quarter');
+    hoursOfDay.enter().append("rect").attr('class', 'time-of-day');
 
     hoursOfDay
       .attr("width", x1.rangeBand())
-      .attr("x", function(d) { return x1(d.DayQuarter); })
+      .attr("x", function(d) { return x1(d.TimeOfDay); })
       .attr("y", function(d) { return y(d.Edits); })
       .attr("height", function(d) { return height - y(d.Edits); })
-      .style("fill", function(d) { return color(d.DayQuarter); });
+      .style("fill", function(d) { return color(d.TimeOfDay); });
 
     hoursOfDay.exit().remove();
 
@@ -172,7 +175,7 @@ loadLineJson("wikiticker-2015-09-12-anonymous-usa.json", function(error, flatDat
       .attr("y", 9)
       .attr("dy", ".35em")
       .style("text-anchor", "end")
-      .text(function(d) { return dayQuarters[d]; });
+      .text(function(d) { return timeOfDayLabels[d]; });
 
   }).done();
 });

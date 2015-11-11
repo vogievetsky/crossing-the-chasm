@@ -78,7 +78,7 @@ var expressionParser;
 var sqlParser;
 var Plywood;
 (function (Plywood) {
-    Plywood.version = '0.7.3';
+    Plywood.version = '0.7.10';
     Plywood.isInstanceOf = ImmutableClass.isInstanceOf;
     Plywood.isImmutableClass = ImmutableClass.isImmutableClass;
     Plywood.Timezone = Chronoshift.Timezone;
@@ -133,6 +133,14 @@ var __extends = (this && this.__extends) || function (d, b) {
 };
 var Plywood;
 (function (Plywood) {
+    var TIME_BUCKETING = {
+        "PT1S": "%Y-%m-%dT%H:%i:%SZ",
+        "PT1M": "%Y-%m-%dT%H:%iZ",
+        "PT1H": "%Y-%m-%dT%H:00Z",
+        "P1D": "%Y-%m-%dZ",
+        "P1M": "%Y-%m-01Z",
+        "P1Y": "%Y-01-01Z"
+    };
     var SQLDialect = (function () {
         function SQLDialect() {
         }
@@ -177,6 +185,9 @@ var Plywood;
                 return endSQL ? endSQL : 'TRUE';
             }
         };
+        SQLDialect.prototype.timeBucketExpression = function (operand, duration, timesone) {
+            throw new Error('Must implement timeBucketExpression');
+        };
         SQLDialect.prototype.offsetTimeExpression = function (operand, duration) {
             throw new Error('Must implement offsetTimeExpression');
         };
@@ -188,6 +199,16 @@ var Plywood;
         function MySQLDialect() {
             _super.call(this);
         }
+        MySQLDialect.prototype.timeBucketExpression = function (operand, duration, timezone) {
+            var bucketFormat = TIME_BUCKETING[duration.toString()];
+            if (!bucketFormat)
+                throw new Error("unsupported duration '" + duration + "'");
+            var bucketTimezone = timezone.toString();
+            if (bucketTimezone !== "Etc/UTC") {
+                operand = "CONVERT_TZ(" + operand + ",'+0:00','" + bucketTimezone + "')";
+            }
+            return "DATE_FORMAT(" + operand + ",'" + bucketFormat + "')";
+        };
         MySQLDialect.prototype.offsetTimeExpression = function (operand, duration) {
             var sqlFn = "DATE_ADD(";
             var spans = duration.valueOf();
@@ -923,6 +944,9 @@ var Plywood;
         NumberRange.prototype.equals = function (other) {
             return NumberRange.isNumberRange(other) && this._equalsHelper(other);
         };
+        NumberRange.prototype.midpoint = function () {
+            return (this.start + this.end) / 2;
+        };
         NumberRange.type = 'NUMBER_RANGE';
         return NumberRange;
     })(Plywood.Range);
@@ -1218,7 +1242,7 @@ var Plywood;
             var valueType = Plywood.getValueType(value);
             if (setType === 'NULL')
                 setType = valueType;
-            if (setType !== valueType)
+            if (valueType !== 'NULL' && setType !== valueType)
                 throw new Error('value type must match');
             if (this.contains(value))
                 return this;
@@ -1486,6 +1510,9 @@ var Plywood;
             if (bounds[1] === ']')
                 end = new Date(end.valueOf() + 1000);
             return dateToIntervalPart(start) + "/" + dateToIntervalPart(end);
+        };
+        TimeRange.prototype.midpoint = function () {
+            return new Date((this.start.valueOf() + this.end.valueOf()) / 2);
         };
         TimeRange.type = 'TIME_RANGE';
         return TimeRange;
@@ -1908,7 +1935,8 @@ var Plywood;
             return sum;
         };
         Dataset.prototype.average = function (exFn, context) {
-            return this.sum(exFn, context) / this.count();
+            var count = this.count();
+            return count ? (this.sum(exFn, context) / count) : null;
         };
         Dataset.prototype.min = function (exFn, context) {
             var data = this.data;
@@ -1923,7 +1951,7 @@ var Plywood;
         };
         Dataset.prototype.max = function (exFn, context) {
             var data = this.data;
-            var max = Infinity;
+            var max = -Infinity;
             for (var _i = 0; _i < data.length; _i++) {
                 var datum = data[_i];
                 var v = exFn(datum, context);
@@ -2305,6 +2333,98 @@ var Plywood;
         }
         External.isExternal = function (candidate) {
             return Plywood.isInstanceOf(candidate, External);
+        };
+        External.getSimpleInflater = function (splitExpression, label) {
+            switch (splitExpression.type) {
+                case 'BOOLEAN': return External.booleanInflaterFactory(label);
+                case 'NUMBER': return External.numberInflaterFactory(label);
+                case 'TIME': return External.timeInflaterFactory(label);
+                default: return null;
+            }
+        };
+        External.booleanInflaterFactory = function (label) {
+            return function (d) {
+                var v = '' + d[label];
+                switch (v) {
+                    case 'null':
+                        d[label] = null;
+                        break;
+                    case 'false':
+                        d[label] = false;
+                        break;
+                    case 'true':
+                        d[label] = true;
+                        break;
+                    default:
+                        throw new Error("got strange result from boolean: " + v);
+                }
+            };
+        };
+        External.timeRangeInflaterFactory = function (label, duration, timezone) {
+            return function (d) {
+                var v = d[label];
+                if ('' + v === "null") {
+                    d[label] = null;
+                    return;
+                }
+                var start = new Date(v);
+                d[label] = new Plywood.TimeRange({ start: start, end: duration.move(start, timezone) });
+            };
+        };
+        External.consecutiveTimeRangeInflaterFactory = function (label, duration, timezone) {
+            var canonicalDurationLengthAndThenSome = duration.getCanonicalLength() * 1.5;
+            return function (d, i, data) {
+                var v = d[label];
+                if ('' + v === "null") {
+                    d[label] = null;
+                    return;
+                }
+                var start = new Date(v);
+                var next = data[i + 1];
+                var nextTimestamp;
+                if (next) {
+                    nextTimestamp = new Date(next[label]);
+                }
+                var end = (nextTimestamp &&
+                    start.valueOf() < nextTimestamp.valueOf() &&
+                    nextTimestamp.valueOf() - start.valueOf() < canonicalDurationLengthAndThenSome) ? nextTimestamp
+                    : duration.move(start, timezone, 1);
+                d[label] = new Plywood.TimeRange({ start: start, end: end });
+            };
+        };
+        External.numberRangeInflaterFactory = function (label, rangeSize) {
+            return function (d) {
+                var v = d[label];
+                if ('' + v === "null") {
+                    d[label] = null;
+                    return;
+                }
+                var start = Number(v);
+                d[label] = new Plywood.NumberRange({
+                    start: start,
+                    end: Plywood.safeAdd(start, rangeSize)
+                });
+            };
+        };
+        External.numberInflaterFactory = function (label) {
+            return function (d) {
+                var v = d[label];
+                if ('' + v === "null") {
+                    d[label] = null;
+                    return;
+                }
+                d[label] = Number(v);
+            };
+        };
+        External.timeInflaterFactory = function (label) {
+            return function (d) {
+                var v = d[label];
+                if ('' + v === "null") {
+                    d[label] = null;
+                    return;
+                }
+                d[label] = new Date(v);
+            };
         };
         External.jsToValue = function (parameters) {
             var value = {
@@ -2884,6 +3004,14 @@ var Plywood;
         WEEK_OF_MONTH: null,
         WEEK_OF_YEAR: "w"
     };
+    var TIME_BUCKET_FORMAT = {
+        "PT1S": "yyyy-MM-dd'T'HH:mm:ss'Z",
+        "PT1M": "yyyy-MM-dd'T'HH:mm'Z",
+        "PT1H": "yyyy-MM-dd'T'HH':00Z",
+        "P1D": "yyyy-MM-dd'Z",
+        "P1M": "yyyy-MM'-01Z",
+        "P1Y": "yyyy'-01-01Z"
+    };
     function simpleMath(exprStr) {
         if (String(exprStr) === 'null')
             return null;
@@ -2919,7 +3047,7 @@ var Plywood;
     function correctSelectResult(result) {
         return Array.isArray(result) && (result.length === 0 || typeof result[0].result === 'object');
     }
-    function postProcessTimeBoundaryFactory(applies) {
+    function timeBoundaryPostProcessFactory(applies) {
         return function (res) {
             if (!correctTimeBoundaryResult(res)) {
                 var err = new Error("unexpected result from Druid (timeBoundary)");
@@ -2958,7 +3086,7 @@ var Plywood;
         }
         return newDatum;
     }
-    function postProcessTotalFactory(applies) {
+    function totalPostProcessFactory(applies) {
         return function (res) {
             if (!correctTimeseriesResult(res)) {
                 var err = new Error("unexpected result from Druid (all)");
@@ -2971,101 +3099,85 @@ var Plywood;
             return new Plywood.Dataset({ data: [res[0].result] });
         };
     }
-    function postProcessTimeseriesFactory(duration, timezone, label) {
+    function timeseriesNormalizerFactory(timestampLabel) {
+        if (timestampLabel === void 0) { timestampLabel = null; }
         return function (res) {
             if (!correctTimeseriesResult(res)) {
                 var err = new Error("unexpected result from Druid (timeseries)");
                 err.result = res;
                 throw err;
             }
-            var canonicalDurationLengthAndThenSome = duration.getCanonicalLength() * 1.5;
-            return new Plywood.Dataset({
-                data: res.map(function (d, i) {
-                    var rangeStart = new Date(d.timestamp);
-                    var next = res[i + 1];
-                    var nextTimestamp;
-                    if (next) {
-                        nextTimestamp = new Date(next.timestamp);
-                    }
-                    var rangeEnd = (nextTimestamp && rangeStart.valueOf() < nextTimestamp.valueOf() &&
-                        nextTimestamp.valueOf() - rangeStart.valueOf() < canonicalDurationLengthAndThenSome) ?
-                        nextTimestamp : duration.move(rangeStart, timezone, 1);
-                    var datum = d.result;
-                    cleanDatumInPlace(datum);
-                    datum[label] = new Plywood.TimeRange({ start: rangeStart, end: rangeEnd });
-                    return datum;
-                })
+            return res.map(function (r) {
+                var datum = r.result;
+                cleanDatumInPlace(datum);
+                if (timestampLabel)
+                    datum[timestampLabel] = r.timestamp;
+                return datum;
             });
         };
     }
-    function postProcessNumberBucketFactory(rangeSize) {
-        return function (v) {
-            var start = Number(v);
-            return new Plywood.NumberRange({
-                start: start,
-                end: Plywood.safeAdd(start, rangeSize)
-            });
-        };
-    }
-    function postProcessTopNFactory(labelProcess, label) {
-        return function (res) {
-            if (!correctTopNResult(res)) {
-                var err = new Error("unexpected result from Druid (topN)");
-                err.result = res;
-                throw err;
-            }
-            var data = res.length ? res[0].result : [];
-            if (labelProcess) {
-                return new Plywood.Dataset({
-                    data: data.map(function (d) {
-                        cleanDatumInPlace(d);
-                        var v = d[label];
-                        if (String(v) === "null") {
-                            v = null;
-                        }
-                        else {
-                            v = labelProcess(v);
-                        }
-                        d[label] = v;
-                        return d;
-                    })
-                });
-            }
-            else {
-                return new Plywood.Dataset({
-                    data: data.map(function (d) {
-                        cleanDatumInPlace(d);
-                        return d;
-                    })
-                });
-            }
-        };
-    }
-    function postProcessGroupBy(res) {
-        if (!correctGroupByResult(res)) {
-            var err = new Error("unexpected result from Druid (groupBy)");
+    function topNNormalizer(res) {
+        if (!correctTopNResult(res)) {
+            var err = new Error("unexpected result from Druid (topN)");
             err.result = res;
             throw err;
         }
-        return new Plywood.Dataset({
-            data: res.map(function (r) {
+        var data = res.length ? res[0].result : [];
+        for (var _i = 0; _i < data.length; _i++) {
+            var d = data[_i];
+            cleanDatumInPlace(d);
+        }
+        return data;
+    }
+    function groupByNormalizerFactory(timestampLabel) {
+        if (timestampLabel === void 0) { timestampLabel = null; }
+        return function (res) {
+            if (!correctGroupByResult(res)) {
+                var err = new Error("unexpected result from Druid (groupBy)");
+                err.result = res;
+                throw err;
+            }
+            return res.map(function (r) {
                 var datum = r.event;
                 cleanDatumInPlace(datum);
+                if (timestampLabel)
+                    datum[timestampLabel] = r.timestamp;
                 return datum;
-            })
-        });
+            });
+        };
     }
-    function postProcessSelect(res) {
+    function selectNormalizer(res) {
         if (!correctSelectResult(res)) {
             var err = new Error("unexpected result from Druid (select)");
             err.result = res;
             throw err;
         }
-        return new Plywood.Dataset({
-            data: res[0].result.events.map(function (event) { return event.event; })
-        });
+        return res[0].result.events.map(function (event) { return event.event; });
     }
-    function postProcessIntrospectFactory(timeAttribute) {
+    function postProcessFactory(normalizer, inflaters) {
+        return function (res) {
+            var data = normalizer(res);
+            var n = data.length;
+            for (var _i = 0; _i < inflaters.length; _i++) {
+                var inflater = inflaters[_i];
+                for (var i = 0; i < n; i++) {
+                    inflater(data[i], i, data);
+                }
+            }
+            return new Plywood.Dataset({ data: data });
+        };
+    }
+    function simpleMathInflaterFactory(label) {
+        return function (d) {
+            var v = d[label];
+            if ('' + v === "null") {
+                d[label] = null;
+                return;
+            }
+            d[label] = simpleMath(v);
+        };
+    }
+    function introspectPostProcessFactory(timeAttribute) {
         return function (res) {
             var attributes = [
                 new Plywood.AttributeInfo({ name: timeAttribute, type: 'TIME' })
@@ -3087,7 +3199,7 @@ var Plywood;
             return attributes;
         };
     }
-    function postProcessSegmentMetadataFactory(timeAttribute) {
+    function segmentMetadataPostProcessFactory(timeAttribute) {
         return function (res) {
             var attributes = [];
             var columns = res[0].columns;
@@ -3487,119 +3599,128 @@ var Plywood;
         DruidExternal.prototype.isTimeRef = function (ex) {
             return ex instanceof Plywood.RefExpression && ex.name === this.timeAttribute;
         };
-        DruidExternal.prototype.splitToDruid = function () {
-            var queryType;
-            var dimension = null;
-            var dimensions = null;
-            var granularity = 'all';
-            var aggregations = null;
-            var postAggregations = null;
-            var postProcess = null;
-            var split = this.split;
-            if (split.isMultiSplit()) {
-                throw new Error('not implemented multi-dim split yet... but we are so very close');
+        DruidExternal.prototype.splitExpressionToGranularityInflater = function (splitExpression, label) {
+            if (splitExpression instanceof Plywood.ChainExpression) {
+                var splitActions = splitExpression.actions;
+                if (this.isTimeRef(splitExpression.expression) && splitActions.length === 1 && splitActions[0].action === 'timeBucket') {
+                    var _a = splitActions[0], duration = _a.duration, timezone = _a.timezone;
+                    return {
+                        granularity: {
+                            type: "period",
+                            period: duration.toString(),
+                            timeZone: timezone.toString()
+                        },
+                        inflater: Plywood.External.timeRangeInflaterFactory(label, duration, timezone)
+                    };
+                }
             }
-            var label = split.firstSplitName();
-            var splitExpression = split.firstSplitExpression();
+            return null;
+        };
+        DruidExternal.prototype.splitExpressionToDimensionInflater = function (splitExpression, label) {
+            var freeReferences = splitExpression.getFreeReferences();
+            if (freeReferences.length !== 1) {
+                throw new Error("must have a single reference: " + splitExpression.toString());
+            }
+            var referenceName = freeReferences[0];
+            var simpleInflater = Plywood.External.getSimpleInflater(splitExpression, label);
             if (splitExpression instanceof Plywood.RefExpression) {
-                var dimensionSpec = (splitExpression.name === label) ?
-                    label : { type: "default", dimension: splitExpression.name, outputName: label };
-                if (this.havingFilter.equals(Plywood.Expression.TRUE) && this.limit && !this.exactResultsOnly) {
-                    var attributeInfo = this.getAttributesInfo(splitExpression.name);
-                    queryType = 'topN';
-                    if (attributeInfo instanceof Plywood.RangeAttributeInfo) {
-                        dimension = {
+                var attributeInfo = this.getAttributesInfo(referenceName);
+                if (attributeInfo instanceof Plywood.RangeAttributeInfo) {
+                    return {
+                        dimension: {
                             type: "extraction",
-                            dimension: splitExpression.name,
+                            dimension: referenceName,
                             outputName: label,
                             extractionFn: this.getRangeBucketingDimension(attributeInfo, null)
-                        };
-                        postProcess = postProcessTopNFactory(postProcessNumberBucketFactory(attributeInfo.rangeSize), label);
-                    }
-                    else {
-                        dimension = dimensionSpec;
-                        postProcess = postProcessTopNFactory(null, null);
-                    }
+                        },
+                        inflater: Plywood.External.numberRangeInflaterFactory(label, attributeInfo.rangeSize)
+                    };
                 }
-                else {
-                    queryType = 'groupBy';
-                    dimensions = [dimensionSpec];
-                    postProcess = postProcessGroupBy;
+                if (splitExpression.type === 'BOOLEAN') {
+                    return {
+                        dimension: {
+                            type: "extraction",
+                            dimension: referenceName,
+                            outputName: label,
+                            extractionFn: {
+                                type: "lookup",
+                                lookup: {
+                                    type: "map",
+                                    map: {
+                                        "0": "false",
+                                        "1": "true",
+                                        "false": "false",
+                                        "true": "true"
+                                    }
+                                },
+                                injective: false
+                            }
+                        },
+                        inflater: simpleInflater
+                    };
                 }
+                return {
+                    dimension: { type: "default", dimension: referenceName, outputName: label },
+                    inflater: simpleInflater
+                };
             }
-            else if (splitExpression instanceof Plywood.ChainExpression) {
-                var pattern;
-                if (pattern = splitExpression.getExpressionPattern('concat')) {
-                    var concatRef = null;
-                    for (var i = 0; i < pattern.length; i++) {
-                        var p = pattern[i];
-                        if (p instanceof Plywood.RefExpression) {
-                            if (concatRef)
-                                throw new Error("can not currently have multiple references in a concat expression: " + splitExpression.toString());
-                            concatRef = p;
-                        }
-                        else if (!(p instanceof Plywood.LiteralExpression)) {
-                            throw new Error("can not have '" + p.toString() + "' inside a concat");
-                        }
-                    }
-                    var concatDimension = {
+            if (splitExpression.type === 'BOOLEAN') {
+                return {
+                    dimension: {
                         type: "extraction",
-                        dimension: concatRef.name,
+                        dimension: referenceName,
                         outputName: label,
                         extractionFn: {
                             type: "javascript",
-                            'function': splitExpression.getJSFn('d'),
-                            injective: true
+                            'function': splitExpression.getJSFn('d')
+                        }
+                    },
+                    inflater: simpleInflater
+                };
+            }
+            if (splitExpression instanceof Plywood.ChainExpression) {
+                if (splitExpression.getExpressionPattern('concat')) {
+                    return {
+                        dimension: {
+                            type: "extraction",
+                            dimension: referenceName,
+                            outputName: label,
+                            extractionFn: {
+                                type: "javascript",
+                                'function': splitExpression.getJSFn('d'),
+                                injective: true
+                            }
                         }
                     };
-                    if (this.havingFilter.equals(Plywood.Expression.TRUE) && this.limit && !this.exactResultsOnly) {
-                        queryType = 'topN';
-                        dimension = concatDimension;
-                        postProcess = postProcessTopNFactory(null, null);
-                    }
-                    else {
-                        queryType = 'groupBy';
-                        dimensions = [concatDimension];
-                        postProcess = postProcessGroupBy;
-                    }
                 }
-                else {
-                    var refExpression = splitExpression.expression;
-                    if (refExpression.op !== 'ref')
-                        throw new Error("can not convert complex: " + refExpression.toString());
-                    var actions = splitExpression.actions;
-                    if (actions.length !== 1)
-                        throw new Error('can not convert expression: ' + splitExpression.toString());
-                    var splitAction = actions[0];
-                    if (splitAction instanceof Plywood.SubstrAction) {
-                        var substrDimension = {
+                if (!splitExpression.expression.isOp('ref')) {
+                    throw new Error("can not convert complex: " + splitExpression.expression.toString());
+                }
+                var actions = splitExpression.actions;
+                if (actions.length !== 1)
+                    throw new Error("can not convert expression: " + splitExpression.toString());
+                var splitAction = actions[0];
+                if (splitAction instanceof Plywood.SubstrAction) {
+                    return {
+                        dimension: {
                             type: "extraction",
-                            dimension: refExpression.name,
+                            dimension: referenceName,
                             outputName: label,
                             extractionFn: {
                                 type: "javascript",
                                 'function': splitExpression.getJSFn('d')
                             }
-                        };
-                        if (this.havingFilter.equals(Plywood.Expression.TRUE) && this.limit && !this.exactResultsOnly) {
-                            queryType = 'topN';
-                            dimension = substrDimension;
-                            postProcess = postProcessTopNFactory(null, null);
                         }
-                        else {
-                            queryType = 'groupBy';
-                            dimensions = [substrDimension];
-                            postProcess = postProcessGroupBy;
-                        }
-                    }
-                    else if (splitAction instanceof Plywood.TimePartAction) {
-                        queryType = 'topN';
-                        var format = TIME_PART_TO_FORMAT[splitAction.part];
-                        if (!format)
-                            throw new Error("unsupported part in timePart expression " + splitAction.part);
-                        dimension = {
+                    };
+                }
+                if (splitAction instanceof Plywood.TimeBucketAction) {
+                    var format = TIME_BUCKET_FORMAT[splitAction.duration.toString()];
+                    if (!format)
+                        throw new Error("unsupported part in timeBucket expression " + splitAction.duration.toString());
+                    return {
+                        dimension: {
                             type: "extraction",
-                            dimension: refExpression.name === this.timeAttribute ? '__time' : refExpression.name,
+                            dimension: referenceName === this.timeAttribute ? '__time' : referenceName,
                             outputName: label,
                             extractionFn: {
                                 type: "timeFormat",
@@ -3607,102 +3728,124 @@ var Plywood;
                                 timeZone: splitAction.timezone.toString(),
                                 locale: "en-US"
                             }
-                        };
-                        postProcess = postProcessTopNFactory(simpleMath, label);
-                    }
-                    else if (splitAction instanceof Plywood.TimeBucketAction) {
-                        if (!this.isTimeRef(refExpression)) {
-                            throw new Error("can not convert complex time bucket: " + refExpression.toString());
-                        }
-                        queryType = 'timeseries';
-                        granularity = {
-                            type: "period",
-                            period: splitAction.duration.toString(),
-                            timeZone: splitAction.timezone.toString()
-                        };
-                        postProcess = postProcessTimeseriesFactory(splitAction.duration, splitAction.timezone, label);
-                    }
-                    else if (splitAction instanceof Plywood.NumberBucketAction) {
-                        var attributeInfo = this.getAttributesInfo(refExpression.name);
-                        queryType = "topN";
-                        if (attributeInfo.type === 'NUMBER') {
-                            var floorExpression = Plywood.continuousFloorExpression("d", "Math.floor", splitAction.size, splitAction.offset);
-                            dimension = {
+                        },
+                        inflater: Plywood.External.timeRangeInflaterFactory(label, splitAction.duration, splitAction.timezone)
+                    };
+                }
+                if (splitAction instanceof Plywood.TimePartAction) {
+                    var format = TIME_PART_TO_FORMAT[splitAction.part];
+                    if (!format)
+                        throw new Error("unsupported part in timePart expression " + splitAction.part);
+                    return {
+                        dimension: {
+                            type: "extraction",
+                            dimension: referenceName === this.timeAttribute ? '__time' : referenceName,
+                            outputName: label,
+                            extractionFn: {
+                                type: "timeFormat",
+                                format: format,
+                                timeZone: splitAction.timezone.toString(),
+                                locale: "en-US"
+                            }
+                        },
+                        inflater: simpleMathInflaterFactory(label)
+                    };
+                }
+                if (splitAction instanceof Plywood.NumberBucketAction) {
+                    var attributeInfo = this.getAttributesInfo(referenceName);
+                    if (attributeInfo.type === 'NUMBER') {
+                        var floorExpression = Plywood.continuousFloorExpression("d", "Math.floor", splitAction.size, splitAction.offset);
+                        return {
+                            dimension: {
                                 type: "extraction",
-                                dimension: refExpression.name,
+                                dimension: referenceName,
                                 outputName: label,
                                 extractionFn: {
                                     type: "javascript",
                                     'function': "function(d){d=Number(d); if(isNaN(d)) return 'null'; return " + floorExpression + ";}"
                                 }
-                            };
-                            postProcess = postProcessTopNFactory(Number, label);
-                        }
-                        else if (attributeInfo instanceof Plywood.RangeAttributeInfo) {
-                            dimension = {
+                            },
+                            inflater: Plywood.External.numberRangeInflaterFactory(label, splitAction.size)
+                        };
+                    }
+                    if (attributeInfo instanceof Plywood.RangeAttributeInfo) {
+                        return {
+                            dimension: {
                                 type: "extraction",
-                                dimension: refExpression.name,
+                                dimension: referenceName,
                                 outputName: label,
                                 extractionFn: this.getRangeBucketingDimension(attributeInfo, splitAction)
-                            };
-                            postProcess = postProcessTopNFactory(postProcessNumberBucketFactory(splitAction.size), label);
-                        }
-                        else if (attributeInfo instanceof Plywood.HistogramAttributeInfo) {
-                            if (this.exactResultsOnly) {
-                                throw new Error("can not use approximate histograms in exactResultsOnly mode");
-                            }
-                            var aggregation = {
-                                type: "approxHistogramFold",
-                                fieldName: refExpression.name
-                            };
-                            if (splitAction.lowerLimit != null) {
-                                aggregation.lowerLimit = splitAction.lowerLimit;
-                            }
-                            if (splitAction.upperLimit != null) {
-                                aggregation.upperLimit = splitAction.upperLimit;
-                            }
-                            aggregations = [aggregation];
-                            postAggregations = [{
-                                    type: "buckets",
-                                    name: "histogram",
-                                    fieldName: "histogram",
-                                    bucketSize: splitAction.size,
-                                    offset: splitAction.offset
-                                }];
-                        }
+                            },
+                            inflater: Plywood.External.numberRangeInflaterFactory(label, splitAction.size)
+                        };
                     }
-                    else {
-                        throw new Error('can not convert given split action: ' + splitExpression.toString());
+                    if (attributeInfo instanceof Plywood.HistogramAttributeInfo) {
+                        if (this.exactResultsOnly) {
+                            throw new Error("can not use approximate histograms in exactResultsOnly mode");
+                        }
+                        throw new Error("histogram splits do not work right now");
                     }
                 }
             }
-            else {
-                throw new Error('can not convert expression: ' + splitExpression.toString());
-            }
-            return {
-                queryType: queryType,
-                granularity: granularity,
-                dimension: dimension,
-                dimensions: dimensions,
-                aggregations: aggregations,
-                postAggregations: postAggregations,
-                postProcess: postProcess
-            };
+            throw new Error("could not convert " + splitExpression.toString() + " to a Druid Dimension");
         };
-        DruidExternal.prototype.operandsToArithmetic = function (operands, fn, aggregations) {
+        DruidExternal.prototype.splitToDruid = function () {
             var _this = this;
-            if (operands.length === 1) {
-                return this.expressionToPostAggregation(operands[0], aggregations);
-            }
-            else {
+            var split = this.split;
+            if (split.isMultiSplit()) {
+                var timestampLabel = null;
+                var granularity = null;
+                var dimensions = [];
+                var inflaters = [];
+                split.mapSplits(function (name, expression) {
+                    if (!granularity && !_this.limit && !_this.sort) {
+                        var granularityInflater = _this.splitExpressionToGranularityInflater(expression, name);
+                        if (granularityInflater) {
+                            timestampLabel = name;
+                            granularity = granularityInflater.granularity;
+                            inflaters.push(granularityInflater.inflater);
+                            return;
+                        }
+                    }
+                    var _a = _this.splitExpressionToDimensionInflater(expression, name), dimension = _a.dimension, inflater = _a.inflater;
+                    dimensions.push(dimension);
+                    if (inflater) {
+                        inflaters.push(inflater);
+                    }
+                });
                 return {
-                    type: 'arithmetic',
-                    fn: fn,
-                    fields: operands.map(function (operand) {
-                        return _this.expressionToPostAggregation(operand, aggregations);
-                    }, this)
+                    queryType: 'groupBy',
+                    dimensions: dimensions,
+                    granularity: granularity || 'all',
+                    postProcess: postProcessFactory(groupByNormalizerFactory(timestampLabel), inflaters)
                 };
             }
+            var splitExpression = split.firstSplitExpression();
+            var label = split.firstSplitName();
+            var granularityInflater = this.splitExpressionToGranularityInflater(splitExpression, label);
+            if (granularityInflater) {
+                return {
+                    queryType: 'timeseries',
+                    granularity: granularityInflater.granularity,
+                    postProcess: postProcessFactory(timeseriesNormalizerFactory(label), [granularityInflater.inflater])
+                };
+            }
+            var dimensionInflater = this.splitExpressionToDimensionInflater(splitExpression, label);
+            var inflaters = [dimensionInflater.inflater].filter(Boolean);
+            if (this.havingFilter.equals(Plywood.Expression.TRUE) && this.limit && !this.exactResultsOnly) {
+                return {
+                    queryType: 'topN',
+                    dimension: dimensionInflater.dimension,
+                    granularity: 'all',
+                    postProcess: postProcessFactory(topNNormalizer, inflaters)
+                };
+            }
+            return {
+                queryType: 'groupBy',
+                dimensions: [dimensionInflater.dimension],
+                granularity: 'all',
+                postProcess: postProcessFactory(groupByNormalizerFactory(), inflaters)
+            };
         };
         DruidExternal.prototype.getAccessTypeForAggregation = function (aggregationType) {
             if (aggregationType === 'hyperUnique' || aggregationType === 'cardinality')
@@ -3937,11 +4080,16 @@ var Plywood;
         };
         DruidExternal.prototype.makeHavingComparison = function (agg, op, value) {
             switch (op) {
-                case '<': return { type: "lessThan", aggregation: agg, value: value };
-                case '>': return { type: "greaterThan", aggregation: agg, value: value };
-                case '<=': return { type: 'not', havingSpec: { type: "greaterThan", aggregation: agg, value: value } };
-                case '>=': return { type: 'not', havingSpec: { type: "lessThan", aggregation: agg, value: value } };
-                default: throw new Error('unknown op: ' + op);
+                case '<':
+                    return { type: "lessThan", aggregation: agg, value: value };
+                case '>':
+                    return { type: "greaterThan", aggregation: agg, value: value };
+                case '<=':
+                    return { type: 'not', havingSpec: { type: "greaterThan", aggregation: agg, value: value } };
+                case '>=':
+                    return { type: 'not', havingSpec: { type: "lessThan", aggregation: agg, value: value } };
+                default:
+                    throw new Error('unknown op: ' + op);
             }
         };
         DruidExternal.prototype.inToHavingFilter = function (agg, range) {
@@ -4068,7 +4216,7 @@ var Plywood;
             }
             return {
                 query: druidQuery,
-                postProcess: postProcessTimeBoundaryFactory(this.applies)
+                postProcess: timeBoundaryPostProcessFactory(this.applies)
             };
         };
         DruidExternal.prototype.getQueryAndPostProcess = function () {
@@ -4104,7 +4252,7 @@ var Plywood;
                     };
                     return {
                         query: druidQuery,
-                        postProcess: postProcessSelect
+                        postProcess: postProcessFactory(selectNormalizer, [])
                     };
                 case 'total':
                     var aggregationsAndPostAggregations = this.getAggregationsAndPostAggregations();
@@ -4116,7 +4264,7 @@ var Plywood;
                     }
                     return {
                         query: druidQuery,
-                        postProcess: postProcessTotalFactory(this.applies)
+                        postProcess: totalPostProcessFactory(this.applies)
                     };
                 case 'split':
                     var aggregationsAndPostAggregations = this.getAggregationsAndPostAggregations();
@@ -4136,10 +4284,6 @@ var Plywood;
                         druidQuery.dimension = splitSpec.dimension;
                     if (splitSpec.dimensions)
                         druidQuery.dimensions = splitSpec.dimensions;
-                    if (splitSpec.aggregations)
-                        druidQuery.aggregations = splitSpec.aggregations;
-                    if (splitSpec.postAggregations)
-                        druidQuery.postAggregations = splitSpec.postAggregations;
                     var postProcess = splitSpec.postProcess;
                     switch (druidQuery.queryType) {
                         case 'timeseries':
@@ -4206,7 +4350,7 @@ var Plywood;
                         merge: true,
                         analysisTypes: []
                     },
-                    postProcess: postProcessSegmentMetadataFactory(this.timeAttribute)
+                    postProcess: segmentMetadataPostProcessFactory(this.timeAttribute)
                 };
             }
             else {
@@ -4215,7 +4359,7 @@ var Plywood;
                         queryType: 'introspect',
                         dataSource: this.getDruidDataSource()
                     },
-                    postProcess: postProcessIntrospectFactory(this.timeAttribute)
+                    postProcess: introspectPostProcessFactory(this.timeAttribute)
                 };
             }
         };
@@ -4234,38 +4378,31 @@ var Plywood;
         return Array.isArray(result) && (result.length === 0 || typeof result[0] === 'object');
     }
     function postProcessFactory(split) {
-        var splitExpression = split ? split.firstSplitExpression() : null;
-        var label = split ? split.firstSplitName() : null;
-        if (splitExpression instanceof Plywood.ChainExpression) {
-            var firstAction = splitExpression.actions[0];
-            if (firstAction instanceof Plywood.TimeBucketAction) {
-                var duration = firstAction.duration;
-                var timezone = firstAction.timezone;
+        var inflaters = split ? split.mapSplits(function (label, splitExpression) {
+            if (splitExpression instanceof Plywood.ChainExpression) {
+                var lastAction = splitExpression.lastAction();
+                if (lastAction instanceof Plywood.TimeBucketAction) {
+                    return Plywood.External.timeRangeInflaterFactory(label, lastAction.duration, lastAction.timezone);
+                }
+                if (lastAction instanceof Plywood.NumberBucketAction) {
+                    return Plywood.External.numberRangeInflaterFactory(label, lastAction.size);
+                }
             }
-            else if (firstAction instanceof Plywood.NumberBucketAction) {
-                var size = firstAction.size;
-            }
-        }
-        return function (res) {
-            if (!correctResult(res)) {
+        }) : [];
+        return function (data) {
+            if (!correctResult(data)) {
                 var err = new Error("unexpected result from MySQL");
-                err.result = res;
+                err.result = data;
                 throw err;
             }
-            if (duration || size) {
-                res.forEach(function (d) {
-                    var v = d[label];
-                    if (duration) {
-                        v = new Date(v);
-                        d[label] = new Plywood.TimeRange({ start: v, end: duration.move(v, timezone) });
-                    }
-                    else {
-                        d[label] = new Plywood.NumberRange({ start: v, end: v + size });
-                    }
-                    return d;
-                });
+            var n = data.length;
+            for (var _i = 0; _i < inflaters.length; _i++) {
+                var inflater = inflaters[_i];
+                for (var i = 0; i < n; i++) {
+                    inflater(data[i], i, data);
+                }
             }
-            return new Plywood.Dataset({ data: res });
+            return new Plywood.Dataset({ data: data });
         };
     }
     function postProcessIntrospect(columns) {
@@ -4508,7 +4645,9 @@ var Plywood;
     function r(value) {
         if (Plywood.External.isExternal(value))
             throw new TypeError('r can not accept externals');
-        return new Plywood.LiteralExpression({ value: value });
+        if (Array.isArray(value))
+            value = Plywood.Set.fromJS(value);
+        return Plywood.LiteralExpression.fromJS({ op: 'literal', value: value });
     }
     Plywood.r = r;
     function mark(selector, prop) {
@@ -4961,6 +5100,7 @@ var Plywood;
             return this.performAction(new Plywood.NumberBucketAction({ size: size, offset: offset }));
         };
         Expression.prototype.timeBucket = function (duration, timezone) {
+            if (timezone === void 0) { timezone = Plywood.Timezone.UTC; }
             if (!Plywood.Duration.isDuration(duration))
                 duration = Plywood.Duration.fromJS(duration);
             if (!Plywood.Timezone.isTimezone(timezone))
@@ -6034,6 +6174,13 @@ var Plywood;
                 })
             ].concat(actions.slice(k));
         };
+        ChainExpression.prototype.firstAction = function () {
+            return this.actions[0];
+        };
+        ChainExpression.prototype.lastAction = function () {
+            var actions = this.actions;
+            return actions[actions.length - 1];
+        };
         ChainExpression.prototype.popAction = function (actionType) {
             var actions = this.actions;
             var lastAction = actions[actions.length - 1];
@@ -6397,6 +6544,9 @@ var Plywood;
         Action.prototype._removeAction = function () {
             return false;
         };
+        Action.prototype._nukeExpression = function () {
+            return null;
+        };
         Action.prototype._distributeAction = function () {
             return null;
         };
@@ -6409,6 +6559,9 @@ var Plywood;
         Action.prototype._foldWithPrevAction = function (prevAction) {
             return null;
         };
+        Action.prototype._putBeforeAction = function (lastAction) {
+            return null;
+        };
         Action.prototype._performOnChain = function (chainExpression) {
             return null;
         };
@@ -6419,6 +6572,9 @@ var Plywood;
                 throw new Error('must get a simple expression');
             if (this._removeAction())
                 return simpleExpression;
+            var nukedExpression = this._nukeExpression();
+            if (nukedExpression)
+                return nukedExpression;
             var distributedActions = this._distributeAction();
             if (distributedActions) {
                 for (var _i = 0; _i < distributedActions.length; _i++) {
@@ -6449,6 +6605,10 @@ var Plywood;
                 var foldedAction = this._foldWithPrevAction(lastAction);
                 if (foldedAction) {
                     return foldedAction.performOnSimple(simpleExpression.popAction());
+                }
+                var beforeAction = this._putBeforeAction(lastAction);
+                if (beforeAction) {
+                    return lastAction.performOnSimple(beforeAction.performOnSimple(simpleExpression.popAction()));
                 }
                 var special = this._performOnChain(simpleExpression);
                 if (special)
@@ -6626,6 +6786,11 @@ var Plywood;
         AndAction.prototype._removeAction = function () {
             return this.expression.equals(Plywood.Expression.TRUE);
         };
+        AndAction.prototype._nukeExpression = function () {
+            if (this.expression.equals(Plywood.Expression.FALSE))
+                return Plywood.Expression.FALSE;
+            return null;
+        };
         AndAction.prototype._distributeAction = function () {
             return this.expression.actionize(this.action);
         };
@@ -6633,21 +6798,13 @@ var Plywood;
             if (literalExpression.equals(Plywood.Expression.TRUE)) {
                 return this.expression;
             }
-            else if (literalExpression.equals(Plywood.Expression.FALSE)) {
-                return Plywood.Expression.FALSE;
-            }
-            return null;
-        };
-        AndAction.prototype._performOnRef = function (refExpression) {
-            if (this.expression.equals(Plywood.Expression.FALSE)) {
+            if (literalExpression.equals(Plywood.Expression.FALSE)) {
                 return Plywood.Expression.FALSE;
             }
             return null;
         };
         AndAction.prototype._performOnChain = function (chainExpression) {
             var expression = this.expression;
-            if (expression.equals(Plywood.Expression.FALSE))
-                return Plywood.Expression.FALSE;
             var andExpressions = chainExpression.getExpressionPattern('and');
             if (andExpressions) {
                 for (var i = 0; i < andExpressions.length; i++) {
@@ -6729,6 +6886,12 @@ var Plywood;
         ApplyAction.prototype.isNester = function () {
             return true;
         };
+        ApplyAction.prototype._putBeforeAction = function (lastAction) {
+            if (this.isSimpleAggregate() && lastAction instanceof ApplyAction && !lastAction.isSimpleAggregate()) {
+                return this;
+            }
+            return null;
+        };
         ApplyAction.prototype._performOnLiteral = function (literalExpression) {
             var dataset = literalExpression.value;
             var myExpression = this.expression;
@@ -6754,27 +6917,6 @@ var Plywood;
                 }
             }
             return null;
-        };
-        ApplyAction.prototype._performOnChain = function (chainExpression) {
-            if (!this.isSimpleAggregate())
-                return null;
-            var actions = chainExpression.actions;
-            var i = actions.length;
-            while (i > 0) {
-                var action = actions[i - 1];
-                if (action.action !== 'apply')
-                    break;
-                if (action.isSimpleAggregate())
-                    break;
-                i--;
-            }
-            actions = actions.slice();
-            actions.splice(i, 0, this);
-            return new Plywood.ChainExpression({
-                expression: chainExpression.expression,
-                actions: actions,
-                simple: true
-            });
         };
         return ApplyAction;
     })(Plywood.Action);
@@ -7211,6 +7353,22 @@ var Plywood;
             }
             return null;
         };
+        FilterAction.prototype._putBeforeAction = function (lastAction) {
+            if (lastAction instanceof Plywood.ApplyAction) {
+                var freeReferences = this.getFreeReferences();
+                return freeReferences.indexOf(lastAction.name) === -1 ? this : null;
+            }
+            if (lastAction instanceof Plywood.SplitAction) {
+                var splits = lastAction.splits;
+                return new FilterAction({
+                    expression: this.expression.substitute(function (ex) {
+                        if (ex instanceof Plywood.RefExpression && splits[ex.name])
+                            return splits[ex.name];
+                    })
+                });
+            }
+            return null;
+        };
         return FilterAction;
     })(Plywood.Action);
     Plywood.FilterAction = FilterAction;
@@ -7374,15 +7532,7 @@ var Plywood;
                     throw new Error('not implemented yet');
             }
         };
-        InAction.prototype._performOnRef = function (refExpression) {
-            var expression = this.expression;
-            if (expression instanceof Plywood.LiteralExpression &&
-                expression.type.indexOf('SET/') === 0 &&
-                expression.value.empty())
-                return Plywood.Expression.FALSE;
-            return null;
-        };
-        InAction.prototype._performOnChain = function (chainExpression) {
+        InAction.prototype._nukeExpression = function () {
             var expression = this.expression;
             if (expression instanceof Plywood.LiteralExpression &&
                 expression.type.indexOf('SET/') === 0 &&
@@ -7448,7 +7598,7 @@ var Plywood;
                 var timezone = lastAction.timezone;
                 var start = literalValue.start;
                 var end = literalValue.end;
-                if (duration.isSimple()) {
+                if (duration.isFloorable()) {
                     if (duration.floor(start, timezone).valueOf() === start.valueOf() &&
                         duration.move(start, timezone, 1).valueOf() === end.valueOf()) {
                         actions = actions.slice(0, -1);
@@ -7684,6 +7834,12 @@ var Plywood;
             }
             return null;
         };
+        LimitAction.prototype._putBeforeAction = function (lastAction) {
+            if (lastAction instanceof Plywood.ApplyAction) {
+                return this;
+            }
+            return null;
+        };
         return LimitAction;
     })(Plywood.Action);
     Plywood.LimitAction = LimitAction;
@@ -7856,6 +8012,11 @@ var Plywood;
         MultiplyAction.prototype._removeAction = function () {
             return this.expression.equals(Plywood.Expression.ONE);
         };
+        MultiplyAction.prototype._nukeExpression = function () {
+            if (this.expression.equals(Plywood.Expression.ZERO))
+                return Plywood.Expression.ZERO;
+            return null;
+        };
         MultiplyAction.prototype._distributeAction = function () {
             return this.expression.actionize(this.action);
         };
@@ -7864,18 +8025,6 @@ var Plywood;
                 return this.expression;
             }
             else if (literalExpression.equals(Plywood.Expression.ZERO)) {
-                return Plywood.Expression.ZERO;
-            }
-            return null;
-        };
-        MultiplyAction.prototype._performOnRef = function (refExpression) {
-            if (this.expression.equals(Plywood.Expression.ZERO)) {
-                return Plywood.Expression.ZERO;
-            }
-            return null;
-        };
-        MultiplyAction.prototype._performOnChain = function (chainExpression) {
-            if (this.expression.equals(Plywood.Expression.ZERO)) {
                 return Plywood.Expression.ZERO;
             }
             return null;
@@ -7992,7 +8141,7 @@ var Plywood;
             };
         };
         NumberBucketAction.prototype._getJSHelper = function (inputJS) {
-            throw new Error("implement me");
+            return Plywood.continuousFloorExpression(inputJS, "Math.floor", this.size, this.offset);
         };
         NumberBucketAction.prototype._getSQLHelper = function (dialect, inputSQL, expressionSQL) {
             return Plywood.continuousFloorExpression(inputSQL, "FLOOR", this.size, this.offset);
@@ -8051,6 +8200,11 @@ var Plywood;
         OrAction.prototype._removeAction = function () {
             return this.expression.equals(Plywood.Expression.FALSE);
         };
+        OrAction.prototype._nukeExpression = function () {
+            if (this.expression.equals(Plywood.Expression.TRUE))
+                return Plywood.Expression.TRUE;
+            return null;
+        };
         OrAction.prototype._distributeAction = function () {
             return this.expression.actionize(this.action);
         };
@@ -8058,21 +8212,13 @@ var Plywood;
             if (literalExpression.equals(Plywood.Expression.FALSE)) {
                 return this.expression;
             }
-            else if (literalExpression.equals(Plywood.Expression.TRUE)) {
-                return Plywood.Expression.TRUE;
-            }
-            return null;
-        };
-        OrAction.prototype._performOnRef = function (refExpression) {
-            if (this.expression.equals(Plywood.Expression.TRUE)) {
+            if (literalExpression.equals(Plywood.Expression.TRUE)) {
                 return Plywood.Expression.TRUE;
             }
             return null;
         };
         OrAction.prototype._performOnChain = function (chainExpression) {
             var expression = this.expression;
-            if (expression.equals(Plywood.Expression.TRUE))
-                return Plywood.Expression.TRUE;
             var orExpressions = chainExpression.getExpressionPattern('or');
             if (orExpressions) {
                 for (var i = 0; i < orExpressions.length; i++) {
@@ -8415,7 +8561,14 @@ var Plywood;
         };
         SplitAction.prototype.mapSplits = function (fn) {
             var _a = this, splits = _a.splits, keys = _a.keys;
-            return keys.map(function (k) { return fn(k, splits[k]); });
+            var res = [];
+            for (var _i = 0; _i < keys.length; _i++) {
+                var k = keys[_i];
+                var v = fn(k, splits[k]);
+                if (typeof v !== 'undefined')
+                    res.push(v);
+            }
+            return res;
         };
         SplitAction.prototype.mapSplitExpressions = function (fn) {
             var _a = this, splits = _a.splits, keys = _a.keys;
@@ -8601,15 +8754,6 @@ var Plywood;
 })(Plywood || (Plywood = {}));
 var Plywood;
 (function (Plywood) {
-    var timeBucketing = {
-        "PT1S": "%Y-%m-%dT%H:%i:%SZ",
-        "PT1M": "%Y-%m-%dT%H:%i:00Z",
-        "PT1H": "%Y-%m-%dT%H:00:00Z",
-        "P1D": "%Y-%m-%dT00:00:00Z",
-        "P1W": "%Y-%m-%dT00:00:00Z",
-        "P1M": "%Y-%m-00T00:00:00Z",
-        "P1Y": "%Y-00-00T00:00:00Z"
-    };
     var TimeBucketAction = (function (_super) {
         __extends(TimeBucketAction, _super);
         function TimeBucketAction(parameters) {
@@ -8666,15 +8810,7 @@ var Plywood;
             throw new Error("implement me");
         };
         TimeBucketAction.prototype._getSQLHelper = function (dialect, inputSQL, expressionSQL) {
-            var bucketFormat = timeBucketing[this.duration.toString()];
-            if (!bucketFormat)
-                throw new Error("unsupported duration '" + this.duration + "'");
-            var bucketTimezone = this.timezone.toString();
-            var expression = inputSQL;
-            if (bucketTimezone !== "Etc/UTC") {
-                expression = "CONVERT_TZ(" + expression + ", '+0:00', '" + bucketTimezone + "')";
-            }
-            return "DATE_FORMAT(" + expression + ", '" + bucketFormat + "')";
+            return dialect.timeBucketExpression(inputSQL, this.duration, this.timezone);
         };
         return TimeBucketAction;
     })(Plywood.Action);
@@ -9162,47 +9298,61 @@ var Chronoshift;
     function adjustDay(day) {
         return (day + 6) % 7;
     }
-    function timeMoverFactory(canonicalLength, floor, move) {
-        return {
-            canonicalLength: canonicalLength,
-            floor: floor,
-            move: move,
-            ceil: function (dt, tz) {
-                return move(floor(dt, tz), tz, 1);
-            }
+    function timeMoverFiller(tm) {
+        var floor = tm.floor, move = tm.move;
+        tm.ceil = function (dt, tz) {
+            var floored = floor(dt, tz);
+            if (floored.valueOf() === dt.valueOf())
+                return dt; // Just like ceil(3) is 3 and not 4
+            return move(floored, tz, 1);
         };
+        return tm;
     }
-    Chronoshift.second = timeMoverFactory(1000, function (dt, tz) {
-        // Seconds do not actually need a timezone because all timezones align on seconds... for now...
-        dt = new Date(dt.valueOf());
-        dt.setUTCMilliseconds(0);
-        return dt;
-    }, function (dt, tz, step) {
-        dt = new Date(dt.valueOf());
-        dt.setUTCSeconds(dt.getUTCSeconds() + step);
-        return dt;
-    });
-    Chronoshift.minute = timeMoverFactory(60000, function (dt, tz) {
-        // Minutes do not actually need a timezone because all timezones align on minutes... for now...
-        dt = new Date(dt.valueOf());
-        dt.setUTCSeconds(0, 0);
-        return dt;
-    }, function (dt, tz, step) {
-        dt = new Date(dt.valueOf());
-        dt.setUTCMinutes(dt.getUTCMinutes() + step);
-        return dt;
-    });
-    Chronoshift.hour = timeMoverFactory(3600000, function (dt, tz) {
-        if (tz.isUTC()) {
+    Chronoshift.second = timeMoverFiller({
+        canonicalLength: 1000,
+        siblings: 60,
+        floor: function (dt, tz) {
+            // Seconds do not actually need a timezone because all timezones align on seconds... for now...
             dt = new Date(dt.valueOf());
-            dt.setUTCMinutes(0, 0, 0);
+            dt.setUTCMilliseconds(0);
+            return dt;
+        },
+        round: function (dt, roundTo, tz) {
+            var cur = dt.getUTCSeconds();
+            var adj = Math.floor(cur / roundTo) * roundTo;
+            if (cur !== adj)
+                dt.setUTCSeconds(adj);
+            return dt;
+        },
+        move: function (dt, tz, step) {
+            dt = new Date(dt.valueOf());
+            dt.setUTCSeconds(dt.getUTCSeconds() + step);
+            return dt;
         }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate(), wt.getHours(), 0, 0, 0);
+    });
+    Chronoshift.minute = timeMoverFiller({
+        canonicalLength: 60000,
+        siblings: 60,
+        floor: function (dt, tz) {
+            // Minutes do not actually need a timezone because all timezones align on minutes... for now...
+            dt = new Date(dt.valueOf());
+            dt.setUTCSeconds(0, 0);
+            return dt;
+        },
+        round: function (dt, roundTo, tz) {
+            var cur = dt.getUTCMinutes();
+            var adj = Math.floor(cur / roundTo) * roundTo;
+            if (cur !== adj)
+                dt.setUTCMinutes(adj);
+            return dt;
+        },
+        move: function (dt, tz, step) {
+            dt = new Date(dt.valueOf());
+            dt.setUTCMinutes(dt.getUTCMinutes() + step);
+            return dt;
         }
-        return dt;
-    }, function (dt, tz, step) {
+    });
+    function hourMove(dt, tz, step) {
         if (tz.isUTC()) {
             dt = new Date(dt.valueOf());
             dt.setUTCHours(dt.getUTCHours() + step);
@@ -9212,62 +9362,90 @@ var Chronoshift;
             dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate(), wt.getHours() + step, wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
         }
         return dt;
+    }
+    Chronoshift.hour = timeMoverFiller({
+        canonicalLength: 3600000,
+        siblings: 24,
+        floor: function (dt, tz) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCMinutes(0, 0, 0);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate(), wt.getHours(), 0, 0, 0);
+            }
+            return dt;
+        },
+        round: function (dt, roundTo, tz) {
+            if (tz.isUTC()) {
+                var cur = dt.getUTCHours();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    dt.setUTCHours(adj);
+            }
+            else {
+                var cur = dt.getHours();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    return hourMove(dt, tz, adj - cur);
+            }
+            return dt;
+        },
+        move: hourMove
     });
-    Chronoshift.day = timeMoverFactory(24 * 3600000, function (dt, tz) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCHours(0, 0, 0, 0);
+    Chronoshift.day = timeMoverFiller({
+        canonicalLength: 24 * 3600000,
+        floor: function (dt, tz) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCHours(0, 0, 0, 0);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate(), 0, 0, 0, 0);
+            }
+            return dt;
+        },
+        move: function (dt, tz, step) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCDate(dt.getUTCDate() + step);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() + step, wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
+            }
+            return dt;
         }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate(), 0, 0, 0, 0);
-        }
-        return dt;
-    }, function (dt, tz, step) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCDate(dt.getUTCDate() + step);
-        }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() + step, wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
-        }
-        return dt;
     });
-    Chronoshift.week = timeMoverFactory(7 * 24 * 3600000, function (dt, tz) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCHours(0, 0, 0, 0);
-            dt.setUTCDate(dt.getUTCDate() - adjustDay(dt.getUTCDay()));
+    Chronoshift.week = timeMoverFiller({
+        canonicalLength: 7 * 24 * 3600000,
+        floor: function (dt, tz) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCHours(0, 0, 0, 0);
+                dt.setUTCDate(dt.getUTCDate() - adjustDay(dt.getUTCDay()));
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() - adjustDay(wt.getDay()), 0, 0, 0, 0);
+            }
+            return dt;
+        },
+        move: function (dt, tz, step) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCDate(dt.getUTCDate() + step * 7);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() + step * 7, wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
+            }
+            return dt;
         }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() - adjustDay(wt.getDay()), 0, 0, 0, 0);
-        }
-        return dt;
-    }, function (dt, tz, step) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCDate(dt.getUTCDate() + step * 7);
-        }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), wt.getDate() + step * 7, wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
-        }
-        return dt;
     });
-    Chronoshift.month = timeMoverFactory(30 * 24 * 3600000, function (dt, tz) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCHours(0, 0, 0, 0);
-            dt.setUTCDate(1);
-        }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), 1, 0, 0, 0, 0);
-        }
-        return dt;
-    }, function (dt, tz, step) {
+    function monthMove(dt, tz, step) {
         if (tz.isUTC()) {
             dt = new Date(dt.valueOf());
             dt.setUTCMonth(dt.getUTCMonth() + step);
@@ -9277,19 +9455,40 @@ var Chronoshift;
             dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth() + step, wt.getDate(), wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
         }
         return dt;
+    }
+    Chronoshift.month = timeMoverFiller({
+        canonicalLength: 30 * 24 * 3600000,
+        siblings: 12,
+        floor: function (dt, tz) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCHours(0, 0, 0, 0);
+                dt.setUTCDate(1);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), wt.getMonth(), 1, 0, 0, 0, 0);
+            }
+            return dt;
+        },
+        round: function (dt, roundTo, tz) {
+            if (tz.isUTC()) {
+                var cur = dt.getUTCMonth();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    dt.setUTCMonth(adj);
+            }
+            else {
+                var cur = dt.getMonth();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    return monthMove(dt, tz, adj - cur);
+            }
+            return dt;
+        },
+        move: monthMove
     });
-    Chronoshift.year = timeMoverFactory(365 * 24 * 3600000, function (dt, tz) {
-        if (tz.isUTC()) {
-            dt = new Date(dt.valueOf());
-            dt.setUTCHours(0, 0, 0, 0);
-            dt.setUTCMonth(0, 1);
-        }
-        else {
-            var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
-            dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), 0, 1, 0, 0, 0, 0);
-        }
-        return dt;
-    }, function (dt, tz, step) {
+    function yearMove(dt, tz, step) {
         if (tz.isUTC()) {
             dt = new Date(dt.valueOf());
             dt.setUTCFullYear(dt.getUTCFullYear() + step);
@@ -9299,6 +9498,38 @@ var Chronoshift;
             dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear() + step, wt.getMonth(), wt.getDate(), wt.getHours(), wt.getMinutes(), wt.getSeconds(), wt.getMilliseconds());
         }
         return dt;
+    }
+    Chronoshift.year = timeMoverFiller({
+        canonicalLength: 365 * 24 * 3600000,
+        siblings: 1000,
+        floor: function (dt, tz) {
+            if (tz.isUTC()) {
+                dt = new Date(dt.valueOf());
+                dt.setUTCHours(0, 0, 0, 0);
+                dt.setUTCMonth(0, 1);
+            }
+            else {
+                var wt = Chronoshift.WallTime.UTCToWallTime(dt, tz.toString());
+                dt = Chronoshift.WallTime.WallTimeToUTC(tz.toString(), wt.getFullYear(), 0, 1, 0, 0, 0, 0);
+            }
+            return dt;
+        },
+        round: function (dt, roundTo, tz) {
+            if (tz.isUTC()) {
+                var cur = dt.getUTCFullYear();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    dt.setUTCFullYear(adj);
+            }
+            else {
+                var cur = dt.getFullYear();
+                var adj = Math.floor(cur / roundTo) * roundTo;
+                if (cur !== adj)
+                    return yearMove(dt, tz, adj - cur);
+            }
+            return dt;
+        },
+        move: yearMove
     });
     Chronoshift.movers = {
         second: Chronoshift.second,
@@ -9314,6 +9545,7 @@ var Chronoshift;
 (function (Chronoshift) {
     var spansWithWeek = ["year", "month", "week", "day", "hour", "minute", "second"];
     var spansWithoutWeek = ["year", "month", "day", "hour", "minute", "second"];
+    var spanMultiplicity = {};
     var periodWeekRegExp = /^P(\d+)W$/;
     var periodRegExp = /^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?$/;
     //                   P   (year ) (month   ) (day     )    T(hour    ) (minute  ) (second  )
@@ -9480,8 +9712,22 @@ var Chronoshift;
                 this.toString() === other.toString();
         };
         Duration.prototype.isSimple = function () {
-            return Boolean(this.singleSpan) &&
-                this.spans[this.singleSpan] === 1;
+            var singleSpan = this.singleSpan;
+            if (!singleSpan)
+                return false;
+            return this.spans[singleSpan] === 1;
+        };
+        Duration.prototype.isFloorable = function () {
+            var singleSpan = this.singleSpan;
+            if (!singleSpan)
+                return false;
+            var span = this.spans[singleSpan];
+            if (span === 1)
+                return true;
+            var siblings = Chronoshift.movers[singleSpan].siblings;
+            if (!siblings)
+                return false;
+            return siblings % span === 0;
         };
         /**
          * Floors the date according to this duration.
@@ -9489,9 +9735,20 @@ var Chronoshift;
          * @param timezone The timezone within which to floor
          */
         Duration.prototype.floor = function (date, timezone) {
-            if (!this.isSimple())
+            var singleSpan = this.singleSpan;
+            if (!singleSpan)
                 throw new Error("Can not floor on a complex duration");
-            return Chronoshift.movers[this.singleSpan].floor(date, timezone);
+            var span = this.spans[singleSpan];
+            var mover = Chronoshift.movers[singleSpan];
+            var dt = mover.floor(date, timezone);
+            if (span !== 1) {
+                if (!mover.siblings)
+                    throw new Error("Can not floor on a " + singleSpan + " duration that is not 1");
+                if (mover.siblings % span !== 0)
+                    throw new Error("Can not floor on a " + singleSpan + " duration that is not a multiple of " + span);
+                dt = mover.round(dt, span, timezone);
+            }
+            return dt;
         };
         /**
          * Moves the given date by 'step' times of the duration
@@ -9903,14 +10160,8 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
     }
   };
 
-  if (typeof window === 'undefined_') {
-    module.exports = helpers;
-  } else if (typeof define !== 'undefined') {
-    define('olson/helpers',helpers);
-  } else {
-    this.WallTime || (this.WallTime = {});
-    this.WallTime.helpers = helpers;
-  }
+  this.WallTime || (this.WallTime = {});
+  this.WallTime.helpers = helpers;
 
 }).call(this);
 
@@ -10095,15 +10346,8 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
     return TimeZoneTime;
   };
 
-  if (typeof window === 'undefined_') {
-    req_helpers = require_("./helpers");
-    module.exports = init(req_helpers);
-  } else if (typeof define !== 'undefined') {
-    define('olson/timezonetime',["olson/helpers"], init);
-  } else {
-    this.WallTime || (this.WallTime = {});
-    this.WallTime.TimeZoneTime = init(this.WallTime.helpers);
-  }
+  this.WallTime || (this.WallTime = {});
+  this.WallTime.TimeZoneTime = init(this.WallTime.helpers);
 
 }).call(this);
 
@@ -10549,16 +10793,8 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
     return lib;
   };
 
-  if (typeof window === 'undefined_') {
-    req_helpers = require_("./helpers");
-    req_TimeZoneTime = require_("./timezonetime");
-    module.exports = init(req_helpers, req_TimeZoneTime);
-  } else if (typeof define !== 'undefined') {
-    define('olson/rule',["olson/helpers", "olson/timezonetime"], init);
-  } else {
-    this.WallTime || (this.WallTime = {});
-    this.WallTime.rule = init(this.WallTime.helpers, this.WallTime.TimeZoneTime);
-  }
+  this.WallTime || (this.WallTime = {});
+  this.WallTime.rule = init(this.WallTime.helpers, this.WallTime.TimeZoneTime);
 
 }).call(this);
 
@@ -10787,17 +11023,8 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
     };
   };
 
-  if (typeof window === 'undefined_') {
-    req_helpers = require_("./helpers");
-    req_rule = require_("./rule");
-    req_TimeZoneTime = require_("./timezonetime");
-    module.exports = init(req_helpers, req_rule, req_TimeZoneTime);
-  } else if (typeof define !== 'undefined') {
-    define('olson/zone',["olson/helpers", "olson/rule", "olson/timezonetime"], init);
-  } else {
-    this.WallTime || (this.WallTime = {});
-    this.WallTime.zone = init(this.WallTime.helpers, this.WallTime.rule, this.WallTime.TimeZoneTime);
-  }
+  this.WallTime || (this.WallTime = {});
+  this.WallTime.zone = init(this.WallTime.helpers, this.WallTime.rule, this.WallTime.TimeZoneTime);
 
 }).call(this);
 
@@ -10971,43 +11198,17 @@ if (typeof module !== 'undefined' && typeof module.exports !== 'undefined') {
     return new WallTime;
   };
 
-  if (typeof window === 'undefined_') {
-    req_zone = require_("./olson/zone");
-    req_rule = require_("./olson/rule");
-    req_help = require_("./olson/helpers");
-    module.exports = init(req_help, req_rule, req_zone);
-  } else if (typeof define !== 'undefined') {
-    if (!require.specified('walltime-data')) {
-      if (typeof console !== "undefined" && console !== null) {
-        if (typeof console.warn === "function") {
-          console.warn("To use WallTime with requirejs please include the walltime-data.js script before requiring walltime");
-        }
-      }
-      define('walltime-data', [], function() {
-        return null;
-      });
-    }
-    define('walltime',['olson/helpers', 'olson/rule', 'olson/zone', 'walltime-data'], function(req_zone, req_rule, req_help, WallTimeData) {
-      var lib;
-      lib = init(req_zone, req_rule, req_help);
-      if (WallTimeData != null ? WallTimeData.zones : void 0) {
-        lib.init(WallTimeData.rules, WallTimeData.zones);
-      }
-      return lib;
-    });
-  } else {
-    this.WallTime || (this.WallTime = {});
-    api = init(this.WallTime.helpers, this.WallTime.rule, this.WallTime.zone);
-    _ref = this.WallTime;
-    for (key in _ref) {
-      if (!__hasProp.call(_ref, key)) continue;
-      val = _ref[key];
-      api[key] = val;
-    }
-    this.WallTime = api;
-    if (this.WallTime.autoinit && ((_ref1 = this.WallTime.data) != null ? _ref1.rules : void 0) && ((_ref2 = this.WallTime.data) != null ? _ref2.zones : void 0)) {
-      this.WallTime.init(this.WallTime.data.rules, this.WallTime.data.zones);
-    }
+  this.WallTime || (this.WallTime = {});
+  api = init(this.WallTime.helpers, this.WallTime.rule, this.WallTime.zone);
+  _ref = this.WallTime;
+  for (key in _ref) {
+    if (!__hasProp.call(_ref, key)) continue;
+    val = _ref[key];
+    api[key] = val;
+  }
+  this.WallTime = api;
+  if (this.WallTime.autoinit && ((_ref1 = this.WallTime.data) != null ? _ref1.rules : void 0) && ((_ref2 = this.WallTime.data) != null ? _ref2.zones : void 0)) {
+    this.WallTime.init(this.WallTime.data.rules, this.WallTime.data.zones);
   }
 
 }).call(this);
@@ -11018,7 +11219,7 @@ module.exports = this.WallTime;
 },{}],5:[function(require,module,exports){
 !function() {
   var d3 = {
-    version: "3.5.6"
+    version: "3.5.8"
   };
   var d3_arraySlice = [].slice, d3_array = function(list) {
     return d3_arraySlice.call(list);
@@ -11649,10 +11850,7 @@ module.exports = this.WallTime;
     prefix: d3_nsPrefix,
     qualify: function(name) {
       var i = name.indexOf(":"), prefix = name;
-      if (i >= 0) {
-        prefix = name.slice(0, i);
-        name = name.slice(i + 1);
-      }
+      if (i >= 0 && (prefix = name.slice(0, i)) !== "xmlns") name = name.slice(i + 1);
       return d3_nsPrefix.hasOwnProperty(prefix) ? {
         space: d3_nsPrefix[prefix],
         local: name
@@ -11863,12 +12061,14 @@ module.exports = this.WallTime;
       if (key) {
         var nodeByKeyValue = new d3_Map(), keyValues = new Array(n), keyValue;
         for (i = -1; ++i < n; ) {
-          if (nodeByKeyValue.has(keyValue = key.call(node = group[i], node.__data__, i))) {
-            exitNodes[i] = node;
-          } else {
-            nodeByKeyValue.set(keyValue, node);
+          if (node = group[i]) {
+            if (nodeByKeyValue.has(keyValue = key.call(node, node.__data__, i))) {
+              exitNodes[i] = node;
+            } else {
+              nodeByKeyValue.set(keyValue, node);
+            }
+            keyValues[i] = keyValue;
           }
-          keyValues[i] = keyValue;
         }
         for (i = -1; ++i < m; ) {
           if (!(node = nodeByKeyValue.get(keyValue = key.call(groupData, nodeData = groupData[i], i)))) {
@@ -11880,7 +12080,7 @@ module.exports = this.WallTime;
           nodeByKeyValue.set(keyValue, true);
         }
         for (i = -1; ++i < n; ) {
-          if (nodeByKeyValue.get(keyValues[i]) !== true) {
+          if (i in keyValues && nodeByKeyValue.get(keyValues[i]) !== true) {
             exitNodes[i] = group[i];
           }
         }
@@ -12072,7 +12272,7 @@ module.exports = this.WallTime;
       group = d3_array(d3_selectAll(nodes, d3_document));
       group.parentNode = d3_document.documentElement;
     } else {
-      group = nodes;
+      group = d3_array(nodes);
       group.parentNode = null;
     }
     return d3_selection([ group ]);
@@ -12303,18 +12503,22 @@ module.exports = this.WallTime;
   }
   var ρ = Math.SQRT2, ρ2 = 2, ρ4 = 4;
   d3.interpolateZoom = function(p0, p1) {
-    var ux0 = p0[0], uy0 = p0[1], w0 = p0[2], ux1 = p1[0], uy1 = p1[1], w1 = p1[2];
-    var dx = ux1 - ux0, dy = uy1 - uy0, d2 = dx * dx + dy * dy, d1 = Math.sqrt(d2), b0 = (w1 * w1 - w0 * w0 + ρ4 * d2) / (2 * w0 * ρ2 * d1), b1 = (w1 * w1 - w0 * w0 - ρ4 * d2) / (2 * w1 * ρ2 * d1), r0 = Math.log(Math.sqrt(b0 * b0 + 1) - b0), r1 = Math.log(Math.sqrt(b1 * b1 + 1) - b1), dr = r1 - r0, S = (dr || Math.log(w1 / w0)) / ρ;
-    function interpolate(t) {
-      var s = t * S;
-      if (dr) {
-        var coshr0 = d3_cosh(r0), u = w0 / (ρ2 * d1) * (coshr0 * d3_tanh(ρ * s + r0) - d3_sinh(r0));
+    var ux0 = p0[0], uy0 = p0[1], w0 = p0[2], ux1 = p1[0], uy1 = p1[1], w1 = p1[2], dx = ux1 - ux0, dy = uy1 - uy0, d2 = dx * dx + dy * dy, i, S;
+    if (d2 < ε2) {
+      S = Math.log(w1 / w0) / ρ;
+      i = function(t) {
+        return [ ux0 + t * dx, uy0 + t * dy, w0 * Math.exp(ρ * t * S) ];
+      };
+    } else {
+      var d1 = Math.sqrt(d2), b0 = (w1 * w1 - w0 * w0 + ρ4 * d2) / (2 * w0 * ρ2 * d1), b1 = (w1 * w1 - w0 * w0 - ρ4 * d2) / (2 * w1 * ρ2 * d1), r0 = Math.log(Math.sqrt(b0 * b0 + 1) - b0), r1 = Math.log(Math.sqrt(b1 * b1 + 1) - b1);
+      S = (r1 - r0) / ρ;
+      i = function(t) {
+        var s = t * S, coshr0 = d3_cosh(r0), u = w0 / (ρ2 * d1) * (coshr0 * d3_tanh(ρ * s + r0) - d3_sinh(r0));
         return [ ux0 + u * dx, uy0 + u * dy, w0 * coshr0 / d3_cosh(ρ * s + r0) ];
-      }
-      return [ ux0 + t * dx, uy0 + t * dy, w0 * Math.exp(ρ * s) ];
+      };
     }
-    interpolate.duration = S * 1e3;
-    return interpolate;
+    i.duration = S * 1e3;
+    return i;
   };
   d3.behavior.zoom = function() {
     var view = {
@@ -12384,8 +12588,9 @@ module.exports = this.WallTime;
       view = {
         x: view.x,
         y: view.y,
-        k: +_
+        k: null
       };
+      scaleTo(+_);
       rescale();
       return zoom;
     };
@@ -12716,9 +12921,8 @@ module.exports = this.WallTime;
     return v < 16 ? "0" + Math.max(0, v).toString(16) : Math.min(255, v).toString(16);
   }
   function d3_rgb_parse(format, rgb, hsl) {
-    format = format.toLowerCase();
     var r = 0, g = 0, b = 0, m1, m2, color;
-    m1 = /([a-z]+)\((.*)\)/.exec(format);
+    m1 = /([a-z]+)\((.*)\)/.exec(format = format.toLowerCase());
     if (m1) {
       m2 = m1[2].split(",");
       switch (m1[1]) {
@@ -13133,17 +13337,19 @@ module.exports = this.WallTime;
   };
   d3.csv = d3.dsv(",", "text/csv");
   d3.tsv = d3.dsv("	", "text/tab-separated-values");
-  var d3_timer_queueHead, d3_timer_queueTail, d3_timer_interval, d3_timer_timeout, d3_timer_active, d3_timer_frame = this[d3_vendorSymbol(this, "requestAnimationFrame")] || function(callback) {
+  var d3_timer_queueHead, d3_timer_queueTail, d3_timer_interval, d3_timer_timeout, d3_timer_frame = this[d3_vendorSymbol(this, "requestAnimationFrame")] || function(callback) {
     setTimeout(callback, 17);
   };
-  d3.timer = function(callback, delay, then) {
+  d3.timer = function() {
+    d3_timer.apply(this, arguments);
+  };
+  function d3_timer(callback, delay, then) {
     var n = arguments.length;
     if (n < 2) delay = 0;
     if (n < 3) then = Date.now();
     var time = then + delay, timer = {
       c: callback,
       t: time,
-      f: false,
       n: null
     };
     if (d3_timer_queueTail) d3_timer_queueTail.n = timer; else d3_timer_queueHead = timer;
@@ -13153,7 +13359,8 @@ module.exports = this.WallTime;
       d3_timer_interval = 1;
       d3_timer_frame(d3_timer_step);
     }
-  };
+    return timer;
+  }
   function d3_timer_step() {
     var now = d3_timer_mark(), delay = d3_timer_sweep() - now;
     if (delay > 24) {
@@ -13172,22 +13379,21 @@ module.exports = this.WallTime;
     d3_timer_sweep();
   };
   function d3_timer_mark() {
-    var now = Date.now();
-    d3_timer_active = d3_timer_queueHead;
-    while (d3_timer_active) {
-      if (now >= d3_timer_active.t) d3_timer_active.f = d3_timer_active.c(now - d3_timer_active.t);
-      d3_timer_active = d3_timer_active.n;
+    var now = Date.now(), timer = d3_timer_queueHead;
+    while (timer) {
+      if (now >= timer.t && timer.c(now - timer.t)) timer.c = null;
+      timer = timer.n;
     }
     return now;
   }
   function d3_timer_sweep() {
     var t0, t1 = d3_timer_queueHead, time = Infinity;
     while (t1) {
-      if (t1.f) {
-        t1 = t0 ? t0.n = t1.n : d3_timer_queueHead = t1.n;
-      } else {
+      if (t1.c) {
         if (t1.t < time) time = t1.t;
         t1 = (t0 = t1).n;
+      } else {
+        t1 = t0 ? t0.n = t1.n : d3_timer_queueHead = t1.n;
       }
     }
     d3_timer_queueTail = t0;
@@ -13202,7 +13408,7 @@ module.exports = this.WallTime;
   var d3_formatPrefixes = [ "y", "z", "a", "f", "p", "n", "µ", "m", "", "k", "M", "G", "T", "P", "E", "Z", "Y" ].map(d3_formatPrefix);
   d3.formatPrefix = function(value, precision) {
     var i = 0;
-    if (value) {
+    if (value = +value) {
       if (value < 0) value *= -1;
       if (precision) value = d3.round(value, d3_format_precision(value, precision));
       i = 1 + Math.floor(1e-12 + Math.log(value) / Math.LN10);
@@ -13552,7 +13758,8 @@ module.exports = this.WallTime;
         if (i != string.length) return null;
         if ("p" in d) d.H = d.H % 12 + d.p * 12;
         var localZ = d.Z != null && d3_date !== d3_date_utc, date = new (localZ ? d3_date_utc : d3_date)();
-        if ("j" in d) date.setFullYear(d.y, 0, d.j); else if ("w" in d && ("W" in d || "U" in d)) {
+        if ("j" in d) date.setFullYear(d.y, 0, d.j); else if ("W" in d || "U" in d) {
+          if (!("w" in d)) d.w = "W" in d ? 1 : 0;
           date.setFullYear(d.y, 0, 1);
           date.setFullYear(d.y, 0, "W" in d ? (d.w + 6) % 7 + d.W * 7 - (date.getDay() + 5) % 7 : d.w + d.U * 7 - (date.getDay() + 6) % 7);
         } else date.setFullYear(d.y, d.m, d.d);
@@ -17004,54 +17211,68 @@ module.exports = this.WallTime;
     f: 0
   };
   d3.interpolateTransform = d3_interpolateTransform;
-  function d3_interpolateTransform(a, b) {
-    var s = [], q = [], n, A = d3.transform(a), B = d3.transform(b), ta = A.translate, tb = B.translate, ra = A.rotate, rb = B.rotate, wa = A.skew, wb = B.skew, ka = A.scale, kb = B.scale;
-    if (ta[0] != tb[0] || ta[1] != tb[1]) {
-      s.push("translate(", null, ",", null, ")");
+  function d3_interpolateTransformPop(s) {
+    return s.length ? s.pop() + "," : "";
+  }
+  function d3_interpolateTranslate(ta, tb, s, q) {
+    if (ta[0] !== tb[0] || ta[1] !== tb[1]) {
+      var i = s.push("translate(", null, ",", null, ")");
       q.push({
-        i: 1,
+        i: i - 4,
         x: d3_interpolateNumber(ta[0], tb[0])
       }, {
-        i: 3,
+        i: i - 2,
         x: d3_interpolateNumber(ta[1], tb[1])
       });
     } else if (tb[0] || tb[1]) {
       s.push("translate(" + tb + ")");
-    } else {
-      s.push("");
     }
-    if (ra != rb) {
+  }
+  function d3_interpolateRotate(ra, rb, s, q) {
+    if (ra !== rb) {
       if (ra - rb > 180) rb += 360; else if (rb - ra > 180) ra += 360;
       q.push({
-        i: s.push(s.pop() + "rotate(", null, ")") - 2,
+        i: s.push(d3_interpolateTransformPop(s) + "rotate(", null, ")") - 2,
         x: d3_interpolateNumber(ra, rb)
       });
     } else if (rb) {
-      s.push(s.pop() + "rotate(" + rb + ")");
+      s.push(d3_interpolateTransformPop(s) + "rotate(" + rb + ")");
     }
-    if (wa != wb) {
+  }
+  function d3_interpolateSkew(wa, wb, s, q) {
+    if (wa !== wb) {
       q.push({
-        i: s.push(s.pop() + "skewX(", null, ")") - 2,
+        i: s.push(d3_interpolateTransformPop(s) + "skewX(", null, ")") - 2,
         x: d3_interpolateNumber(wa, wb)
       });
     } else if (wb) {
-      s.push(s.pop() + "skewX(" + wb + ")");
+      s.push(d3_interpolateTransformPop(s) + "skewX(" + wb + ")");
     }
-    if (ka[0] != kb[0] || ka[1] != kb[1]) {
-      n = s.push(s.pop() + "scale(", null, ",", null, ")");
+  }
+  function d3_interpolateScale(ka, kb, s, q) {
+    if (ka[0] !== kb[0] || ka[1] !== kb[1]) {
+      var i = s.push(d3_interpolateTransformPop(s) + "scale(", null, ",", null, ")");
       q.push({
-        i: n - 4,
+        i: i - 4,
         x: d3_interpolateNumber(ka[0], kb[0])
       }, {
-        i: n - 2,
+        i: i - 2,
         x: d3_interpolateNumber(ka[1], kb[1])
       });
-    } else if (kb[0] != 1 || kb[1] != 1) {
-      s.push(s.pop() + "scale(" + kb + ")");
+    } else if (kb[0] !== 1 || kb[1] !== 1) {
+      s.push(d3_interpolateTransformPop(s) + "scale(" + kb + ")");
     }
-    n = q.length;
+  }
+  function d3_interpolateTransform(a, b) {
+    var s = [], q = [];
+    a = d3.transform(a), b = d3.transform(b);
+    d3_interpolateTranslate(a.translate, b.translate, s, q);
+    d3_interpolateRotate(a.rotate, b.rotate, s, q);
+    d3_interpolateSkew(a.skew, b.skew, s, q);
+    d3_interpolateScale(a.scale, b.scale, s, q);
+    a = b = null;
     return function(t) {
-      var i = -1, o;
+      var i = -1, n = q.length, o;
       while (++i < n) s[(o = q[i]).i] = o.x(t);
       return s.join("");
     };
@@ -17223,7 +17444,7 @@ module.exports = this.WallTime;
     return chord;
   };
   d3.layout.force = function() {
-    var force = {}, event = d3.dispatch("start", "tick", "end"), size = [ 1, 1 ], drag, alpha, friction = .9, linkDistance = d3_layout_forceLinkDistance, linkStrength = d3_layout_forceLinkStrength, charge = -30, chargeDistance2 = d3_layout_forceChargeDistance2, gravity = .1, theta2 = .64, nodes = [], links = [], distances, strengths, charges;
+    var force = {}, event = d3.dispatch("start", "tick", "end"), timer, size = [ 1, 1 ], drag, alpha, friction = .9, linkDistance = d3_layout_forceLinkDistance, linkStrength = d3_layout_forceLinkStrength, charge = -30, chargeDistance2 = d3_layout_forceChargeDistance2, gravity = .1, theta2 = .64, nodes = [], links = [], distances, strengths, charges;
     function repulse(node) {
       return function(quad, x1, _, x2) {
         if (quad.point !== node) {
@@ -17247,6 +17468,7 @@ module.exports = this.WallTime;
     }
     force.tick = function() {
       if ((alpha *= .99) < .005) {
+        timer = null;
         event.end({
           type: "end",
           alpha: alpha = 0
@@ -17264,7 +17486,7 @@ module.exports = this.WallTime;
           l = alpha * strengths[i] * ((l = Math.sqrt(l)) - distances[i]) / l;
           x *= l;
           y *= l;
-          t.x -= x * (k = s.weight / (t.weight + s.weight));
+          t.x -= x * (k = s.weight + t.weight ? s.weight / (s.weight + t.weight) : .5);
           t.y -= y * k;
           s.x += x * (k = 1 - k);
           s.y += y * k;
@@ -17360,13 +17582,21 @@ module.exports = this.WallTime;
       if (!arguments.length) return alpha;
       x = +x;
       if (alpha) {
-        if (x > 0) alpha = x; else alpha = 0;
+        if (x > 0) {
+          alpha = x;
+        } else {
+          timer.c = null, timer.t = NaN, timer = null;
+          event.start({
+            type: "end",
+            alpha: alpha = 0
+          });
+        }
       } else if (x > 0) {
         event.start({
           type: "start",
           alpha: alpha = x
         });
-        d3.timer(force.tick);
+        timer = d3_timer(force.tick);
       }
       return force;
     };
@@ -17620,7 +17850,7 @@ module.exports = this.WallTime;
     function pie(data) {
       var n = data.length, values = data.map(function(d, i) {
         return +value.call(pie, d, i);
-      }), a = +(typeof startAngle === "function" ? startAngle.apply(this, arguments) : startAngle), da = (typeof endAngle === "function" ? endAngle.apply(this, arguments) : endAngle) - a, p = Math.min(Math.abs(da) / n, +(typeof padAngle === "function" ? padAngle.apply(this, arguments) : padAngle)), pa = p * (da < 0 ? -1 : 1), k = (da - n * pa) / d3.sum(values), index = d3.range(n), arcs = [], v;
+      }), a = +(typeof startAngle === "function" ? startAngle.apply(this, arguments) : startAngle), da = (typeof endAngle === "function" ? endAngle.apply(this, arguments) : endAngle) - a, p = Math.min(Math.abs(da) / n, +(typeof padAngle === "function" ? padAngle.apply(this, arguments) : padAngle)), pa = p * (da < 0 ? -1 : 1), sum = d3.sum(values), k = sum ? (da - n * pa) / sum : 0, index = d3.range(n), arcs = [], v;
       if (sort != null) index.sort(sort === d3_layout_pieSortByValue ? function(i, j) {
         return values[j] - values[i];
       } : function(i, j) {
@@ -18333,10 +18563,8 @@ module.exports = this.WallTime;
     }
     function treemap(d) {
       var nodes = stickies || hierarchy(d), root = nodes[0];
-      root.x = 0;
-      root.y = 0;
-      root.dx = size[0];
-      root.dy = size[1];
+      root.x = root.y = 0;
+      if (root.value) root.dx = size[0], root.dy = size[1]; else root.dx = root.dy = 0;
       if (stickies) hierarchy.revalue(root);
       scale([ root ], root.dx * root.dy / root.value);
       (stickies ? stickify : squarify)(root);
@@ -19000,11 +19228,16 @@ module.exports = this.WallTime;
       } else {
         x2 = y2 = 0;
       }
-      if ((rc = Math.min(Math.abs(r1 - r0) / 2, +cornerRadius.apply(this, arguments))) > .001) {
+      if (da > ε && (rc = Math.min(Math.abs(r1 - r0) / 2, +cornerRadius.apply(this, arguments))) > .001) {
         cr = r0 < r1 ^ cw ? 0 : 1;
-        var oc = x3 == null ? [ x2, y2 ] : x1 == null ? [ x0, y0 ] : d3_geom_polygonIntersect([ x0, y0 ], [ x3, y3 ], [ x1, y1 ], [ x2, y2 ]), ax = x0 - oc[0], ay = y0 - oc[1], bx = x1 - oc[0], by = y1 - oc[1], kc = 1 / Math.sin(Math.acos((ax * bx + ay * by) / (Math.sqrt(ax * ax + ay * ay) * Math.sqrt(bx * bx + by * by))) / 2), lc = Math.sqrt(oc[0] * oc[0] + oc[1] * oc[1]);
+        var rc1 = rc, rc0 = rc;
+        if (da < π) {
+          var oc = x3 == null ? [ x2, y2 ] : x1 == null ? [ x0, y0 ] : d3_geom_polygonIntersect([ x0, y0 ], [ x3, y3 ], [ x1, y1 ], [ x2, y2 ]), ax = x0 - oc[0], ay = y0 - oc[1], bx = x1 - oc[0], by = y1 - oc[1], kc = 1 / Math.sin(Math.acos((ax * bx + ay * by) / (Math.sqrt(ax * ax + ay * ay) * Math.sqrt(bx * bx + by * by))) / 2), lc = Math.sqrt(oc[0] * oc[0] + oc[1] * oc[1]);
+          rc0 = Math.min(rc, (r0 - lc) / (kc - 1));
+          rc1 = Math.min(rc, (r1 - lc) / (kc + 1));
+        }
         if (x1 != null) {
-          var rc1 = Math.min(rc, (r1 - lc) / (kc + 1)), t30 = d3_svg_arcCornerTangents(x3 == null ? [ x2, y2 ] : [ x3, y3 ], [ x0, y0 ], r1, rc1, cw), t12 = d3_svg_arcCornerTangents([ x1, y1 ], [ x2, y2 ], r1, rc1, cw);
+          var t30 = d3_svg_arcCornerTangents(x3 == null ? [ x2, y2 ] : [ x3, y3 ], [ x0, y0 ], r1, rc1, cw), t12 = d3_svg_arcCornerTangents([ x1, y1 ], [ x2, y2 ], r1, rc1, cw);
           if (rc === rc1) {
             path.push("M", t30[0], "A", rc1, ",", rc1, " 0 0,", cr, " ", t30[1], "A", r1, ",", r1, " 0 ", 1 - cw ^ d3_svg_arcSweep(t30[1][0], t30[1][1], t12[1][0], t12[1][1]), ",", cw, " ", t12[1], "A", rc1, ",", rc1, " 0 0,", cr, " ", t12[0]);
           } else {
@@ -19014,7 +19247,7 @@ module.exports = this.WallTime;
           path.push("M", x0, ",", y0);
         }
         if (x3 != null) {
-          var rc0 = Math.min(rc, (r0 - lc) / (kc - 1)), t03 = d3_svg_arcCornerTangents([ x0, y0 ], [ x3, y3 ], r0, -rc0, cw), t21 = d3_svg_arcCornerTangents([ x2, y2 ], x1 == null ? [ x0, y0 ] : [ x1, y1 ], r0, -rc0, cw);
+          var t03 = d3_svg_arcCornerTangents([ x0, y0 ], [ x3, y3 ], r0, -rc0, cw), t21 = d3_svg_arcCornerTangents([ x2, y2 ], x1 == null ? [ x0, y0 ] : [ x1, y1 ], r0, -rc0, cw);
           if (rc === rc0) {
             path.push("L", t21[0], "A", rc0, ",", rc0, " 0 0,", cr, " ", t21[1], "A", r0, ",", r0, " 0 ", cw ^ d3_svg_arcSweep(t21[1][0], t21[1][1], t03[1][0], t03[1][1]), ",", 1 - cw, " ", t03[1], "A", rc0, ",", rc0, " 0 0,", cr, " ", t03[0]);
           } else {
@@ -19096,7 +19329,7 @@ module.exports = this.WallTime;
     return (x0 - x1) * y0 - (y0 - y1) * x0 > 0 ? 0 : 1;
   }
   function d3_svg_arcCornerTangents(p0, p1, r1, rc, cw) {
-    var x01 = p0[0] - p1[0], y01 = p0[1] - p1[1], lo = (cw ? rc : -rc) / Math.sqrt(x01 * x01 + y01 * y01), ox = lo * y01, oy = -lo * x01, x1 = p0[0] + ox, y1 = p0[1] + oy, x2 = p1[0] + ox, y2 = p1[1] + oy, x3 = (x1 + x2) / 2, y3 = (y1 + y2) / 2, dx = x2 - x1, dy = y2 - y1, d2 = dx * dx + dy * dy, r = r1 - rc, D = x1 * y2 - x2 * y1, d = (dy < 0 ? -1 : 1) * Math.sqrt(r * r * d2 - D * D), cx0 = (D * dy - dx * d) / d2, cy0 = (-D * dx - dy * d) / d2, cx1 = (D * dy + dx * d) / d2, cy1 = (-D * dx + dy * d) / d2, dx0 = cx0 - x3, dy0 = cy0 - y3, dx1 = cx1 - x3, dy1 = cy1 - y3;
+    var x01 = p0[0] - p1[0], y01 = p0[1] - p1[1], lo = (cw ? rc : -rc) / Math.sqrt(x01 * x01 + y01 * y01), ox = lo * y01, oy = -lo * x01, x1 = p0[0] + ox, y1 = p0[1] + oy, x2 = p1[0] + ox, y2 = p1[1] + oy, x3 = (x1 + x2) / 2, y3 = (y1 + y2) / 2, dx = x2 - x1, dy = y2 - y1, d2 = dx * dx + dy * dy, r = r1 - rc, D = x1 * y2 - x2 * y1, d = (dy < 0 ? -1 : 1) * Math.sqrt(Math.max(0, r * r * d2 - D * D)), cx0 = (D * dy - dx * d) / d2, cy0 = (-D * dx - dy * d) / d2, cx1 = (D * dy + dx * d) / d2, cy1 = (-D * dx + dy * d) / d2, dx0 = cx0 - x3, dy0 = cy0 - y3, dx1 = cx1 - x3, dy1 = cy1 - y3;
     if (dx0 * dx0 + dy0 * dy0 > dx1 * dx1 + dy1 * dy1) cx0 = cx1, cy0 = cy1;
     return [ [ cx0 - ox, cy0 - oy ], [ cx0 * r1 / r, cy0 * r1 / r ] ];
   }
@@ -19168,10 +19401,10 @@ module.exports = this.WallTime;
     value.closed = /-closed$/.test(key);
   });
   function d3_svg_lineLinear(points) {
-    return points.join("L");
+    return points.length > 1 ? points.join("L") : points + "Z";
   }
   function d3_svg_lineLinearClosed(points) {
-    return d3_svg_lineLinear(points) + "Z";
+    return points.join("L") + "Z";
   }
   function d3_svg_lineStep(points) {
     var i = 0, n = points.length, p = points[0], path = [ p[0], ",", p[1] ];
@@ -19193,7 +19426,7 @@ module.exports = this.WallTime;
     return points.length < 4 ? d3_svg_lineLinear(points) : points[1] + d3_svg_lineHermite(points.slice(1, -1), d3_svg_lineCardinalTangents(points, tension));
   }
   function d3_svg_lineCardinalClosed(points, tension) {
-    return points.length < 3 ? d3_svg_lineLinear(points) : points[0] + d3_svg_lineHermite((points.push(points[0]), 
+    return points.length < 3 ? d3_svg_lineLinearClosed(points) : points[0] + d3_svg_lineHermite((points.push(points[0]), 
     points), d3_svg_lineCardinalTangents([ points[points.length - 2] ].concat(points, [ points[1] ]), tension));
   }
   function d3_svg_lineCardinal(points, tension) {
@@ -19629,9 +19862,11 @@ module.exports = this.WallTime;
   var d3_selection_interrupt = d3_selection_interruptNS(d3_transitionNamespace());
   function d3_selection_interruptNS(ns) {
     return function() {
-      var lock, active;
-      if ((lock = this[ns]) && (active = lock[lock.active])) {
-        if (--lock.count) delete lock[lock.active]; else delete this[ns];
+      var lock, activeId, active;
+      if ((lock = this[ns]) && (active = lock[activeId = lock.active])) {
+        active.timer.c = null;
+        active.timer.t = NaN;
+        if (--lock.count) delete lock[activeId]; else delete this[ns];
         lock.active += .5;
         active.event && active.event.interrupt.call(this, this.__data__, active.index);
       }
@@ -19886,12 +20121,68 @@ module.exports = this.WallTime;
     var lock = node[ns] || (node[ns] = {
       active: 0,
       count: 0
-    }), transition = lock[id];
+    }), transition = lock[id], time, timer, duration, ease, tweens;
+    function schedule(elapsed) {
+      var delay = transition.delay;
+      timer.t = delay + time;
+      if (delay <= elapsed) return start(elapsed - delay);
+      timer.c = start;
+    }
+    function start(elapsed) {
+      var activeId = lock.active, active = lock[activeId];
+      if (active) {
+        active.timer.c = null;
+        active.timer.t = NaN;
+        --lock.count;
+        delete lock[activeId];
+        active.event && active.event.interrupt.call(node, node.__data__, active.index);
+      }
+      for (var cancelId in lock) {
+        if (+cancelId < id) {
+          var cancel = lock[cancelId];
+          cancel.timer.c = null;
+          cancel.timer.t = NaN;
+          --lock.count;
+          delete lock[cancelId];
+        }
+      }
+      lock.active = id;
+      transition.event && transition.event.start.call(node, node.__data__, i);
+      tweens = [];
+      transition.tween.forEach(function(key, value) {
+        if (value = value.call(node, node.__data__, i)) {
+          tweens.push(value);
+        }
+      });
+      ease = transition.ease;
+      duration = transition.duration;
+      timer.c = tick;
+      d3_timer(function() {
+        if (timer.c && tick(elapsed || 1)) {
+          timer.c = null;
+          timer.t = NaN;
+        }
+        return 1;
+      }, 0, time);
+    }
+    function tick(elapsed) {
+      var t = elapsed / duration, e = ease(t), n = tweens.length;
+      while (n > 0) {
+        tweens[--n].call(node, e);
+      }
+      if (t >= 1) {
+        transition.event && transition.event.end.call(node, node.__data__, i);
+        if (--lock.count) delete lock[id]; else delete node[ns];
+        return 1;
+      }
+    }
     if (!transition) {
-      var time = inherit.time;
+      time = inherit.time;
+      timer = d3_timer(schedule, 0, time);
       transition = lock[id] = {
         tween: new d3_Map(),
         time: time,
+        timer: timer,
         delay: inherit.delay,
         duration: inherit.duration,
         ease: inherit.ease,
@@ -19899,49 +20190,6 @@ module.exports = this.WallTime;
       };
       inherit = null;
       ++lock.count;
-      d3.timer(function(elapsed) {
-        var delay = transition.delay, duration, ease, timer = d3_timer_active, tweened = [];
-        timer.t = delay + time;
-        if (delay <= elapsed) return start(elapsed - delay);
-        timer.c = start;
-        function start(elapsed) {
-          if (lock.active > id) return stop();
-          var active = lock[lock.active];
-          if (active) {
-            --lock.count;
-            delete lock[lock.active];
-            active.event && active.event.interrupt.call(node, node.__data__, active.index);
-          }
-          lock.active = id;
-          transition.event && transition.event.start.call(node, node.__data__, i);
-          transition.tween.forEach(function(key, value) {
-            if (value = value.call(node, node.__data__, i)) {
-              tweened.push(value);
-            }
-          });
-          ease = transition.ease;
-          duration = transition.duration;
-          d3.timer(function() {
-            timer.c = tick(elapsed || 1) ? d3_true : tick;
-            return 1;
-          }, 0, time);
-        }
-        function tick(elapsed) {
-          if (lock.active !== id) return 1;
-          var t = elapsed / duration, e = ease(t), n = tweened.length;
-          while (n > 0) {
-            tweened[--n].call(node, e);
-          }
-          if (t >= 1) {
-            transition.event && transition.event.end.call(node, node.__data__, i);
-            return stop();
-          }
-        }
-        function stop() {
-          if (--lock.count) delete lock[id]; else delete node[ns];
-          return 1;
-        }
-      }, 0, time);
     }
   }
   d3.svg.axis = function() {
@@ -19995,7 +20243,7 @@ module.exports = this.WallTime;
     };
     axis.ticks = function() {
       if (!arguments.length) return tickArguments_;
-      tickArguments_ = arguments;
+      tickArguments_ = d3_array(arguments);
       return axis;
     };
     axis.tickValues = function(x) {
@@ -20517,8 +20765,7 @@ module.exports = this.WallTime;
   d3.xml = d3_xhrType(function(request) {
     return request.responseXML;
   });
-  if (typeof define === "function" && define.amd) define(d3); else if (typeof module === "object" && module.exports) module.exports = d3;
-  this.d3 = d3;
+  if (typeof define === "function" && define.amd) define(this.d3 = d3); else if (typeof module === "object" && module.exports) module.exports = d3; else this.d3 = d3;
 }();
 },{}],6:[function(require,module,exports){
 "use strict";
@@ -22753,7 +23000,7 @@ module.exports = function(plywood) {
             },
         peg$c44 = ",",
         peg$c45 = { type: "literal", value: ",", description: "\",\"" },
-        peg$c46 = function(head, tail) { return [head].concat(tail.map(function(t) { return t[3] })); },
+        peg$c46 = function(head, tail) { return makeListMap3(head, tail); },
         peg$c47 = "ply(",
         peg$c48 = { type: "literal", value: "ply(", description: "\"ply(\"" },
         peg$c49 = function() { return ply(); },
@@ -22771,65 +23018,72 @@ module.exports = function(plywood) {
         peg$c61 = "}",
         peg$c62 = { type: "literal", value: "}", description: "\"}\"" },
         peg$c63 = function(value) { return r(value); },
-        peg$c64 = { type: "other", description: "String" },
-        peg$c65 = "'",
-        peg$c66 = { type: "literal", value: "'", description: "\"'\"" },
-        peg$c67 = function(chars) { return chars; },
-        peg$c68 = function(chars) { error("Unmatched single quote"); },
-        peg$c69 = "\"",
-        peg$c70 = { type: "literal", value: "\"", description: "\"\\\"\"" },
-        peg$c71 = function(chars) { error("Unmatched double quote"); },
-        peg$c72 = "null",
-        peg$c73 = { type: "literal", value: "null", description: "\"null\"" },
-        peg$c74 = function() { return null; },
-        peg$c75 = "false",
-        peg$c76 = { type: "literal", value: "false", description: "\"false\"" },
-        peg$c77 = function() { return false; },
-        peg$c78 = "true",
-        peg$c79 = { type: "literal", value: "true", description: "\"true\"" },
-        peg$c80 = function() { return true; },
-        peg$c81 = "not",
-        peg$c82 = { type: "literal", value: "not", description: "\"not\"" },
-        peg$c83 = "and",
-        peg$c84 = { type: "literal", value: "and", description: "\"and\"" },
-        peg$c85 = "or",
-        peg$c86 = { type: "literal", value: "or", description: "\"or\"" },
-        peg$c87 = "++",
-        peg$c88 = { type: "literal", value: "++", description: "\"++\"" },
-        peg$c89 = /^[A-Za-z_]/,
-        peg$c90 = { type: "class", value: "[A-Za-z_]", description: "[A-Za-z_]" },
-        peg$c91 = { type: "other", description: "Number" },
-        peg$c92 = function(n) { return parseFloat(n); },
-        peg$c93 = "-",
-        peg$c94 = { type: "literal", value: "-", description: "\"-\"" },
-        peg$c95 = /^[1-9]/,
-        peg$c96 = { type: "class", value: "[1-9]", description: "[1-9]" },
-        peg$c97 = "e",
-        peg$c98 = { type: "literal", value: "e", description: "\"e\"" },
-        peg$c99 = /^[0-9]/,
-        peg$c100 = { type: "class", value: "[0-9]", description: "[0-9]" },
-        peg$c101 = "ply",
-        peg$c102 = { type: "literal", value: "ply", description: "\"ply\"" },
-        peg$c103 = { type: "other", description: "CallFn" },
-        peg$c104 = /^[a-zA-Z]/,
-        peg$c105 = { type: "class", value: "[a-zA-Z]", description: "[a-zA-Z]" },
-        peg$c106 = { type: "other", description: "Name" },
-        peg$c107 = /^[a-zA-Z_]/,
-        peg$c108 = { type: "class", value: "[a-zA-Z_]", description: "[a-zA-Z_]" },
-        peg$c109 = /^[a-z0-9A-Z_]/,
-        peg$c110 = { type: "class", value: "[a-z0-9A-Z_]", description: "[a-z0-9A-Z_]" },
-        peg$c111 = { type: "other", description: "TypeName" },
-        peg$c112 = /^[A-Z_\/]/,
-        peg$c113 = { type: "class", value: "[A-Z_/]", description: "[A-Z_/]" },
-        peg$c114 = { type: "other", description: "NotSQuote" },
-        peg$c115 = /^[^']/,
-        peg$c116 = { type: "class", value: "[^']", description: "[^']" },
-        peg$c117 = { type: "other", description: "NotDQuote" },
-        peg$c118 = /^[^"]/,
-        peg$c119 = { type: "class", value: "[^\"]", description: "[^\"]" },
-        peg$c120 = { type: "other", description: "Whitespace" },
-        peg$c121 = /^[ \t\r\n]/,
-        peg$c122 = { type: "class", value: "[ \\t\\r\\n]", description: "[ \\t\\r\\n]" },
+        peg$c64 = { type: "other", description: "StringSet" },
+        peg$c65 = "[",
+        peg$c66 = { type: "literal", value: "[", description: "\"[\"" },
+        peg$c67 = "]",
+        peg$c68 = { type: "literal", value: "]", description: "\"]\"" },
+        peg$c69 = function(head, tail) { return Set.fromJS(makeListMap3(head, tail)); },
+        peg$c70 = { type: "other", description: "NumberSet" },
+        peg$c71 = { type: "other", description: "String" },
+        peg$c72 = "'",
+        peg$c73 = { type: "literal", value: "'", description: "\"'\"" },
+        peg$c74 = function(chars) { return chars; },
+        peg$c75 = function(chars) { error("Unmatched single quote"); },
+        peg$c76 = "\"",
+        peg$c77 = { type: "literal", value: "\"", description: "\"\\\"\"" },
+        peg$c78 = function(chars) { error("Unmatched double quote"); },
+        peg$c79 = "null",
+        peg$c80 = { type: "literal", value: "null", description: "\"null\"" },
+        peg$c81 = function() { return null; },
+        peg$c82 = "false",
+        peg$c83 = { type: "literal", value: "false", description: "\"false\"" },
+        peg$c84 = function() { return false; },
+        peg$c85 = "true",
+        peg$c86 = { type: "literal", value: "true", description: "\"true\"" },
+        peg$c87 = function() { return true; },
+        peg$c88 = "not",
+        peg$c89 = { type: "literal", value: "not", description: "\"not\"" },
+        peg$c90 = "and",
+        peg$c91 = { type: "literal", value: "and", description: "\"and\"" },
+        peg$c92 = "or",
+        peg$c93 = { type: "literal", value: "or", description: "\"or\"" },
+        peg$c94 = "++",
+        peg$c95 = { type: "literal", value: "++", description: "\"++\"" },
+        peg$c96 = /^[A-Za-z_]/,
+        peg$c97 = { type: "class", value: "[A-Za-z_]", description: "[A-Za-z_]" },
+        peg$c98 = { type: "other", description: "Number" },
+        peg$c99 = function(n) { return parseFloat(n); },
+        peg$c100 = "-",
+        peg$c101 = { type: "literal", value: "-", description: "\"-\"" },
+        peg$c102 = /^[1-9]/,
+        peg$c103 = { type: "class", value: "[1-9]", description: "[1-9]" },
+        peg$c104 = "e",
+        peg$c105 = { type: "literal", value: "e", description: "\"e\"" },
+        peg$c106 = /^[0-9]/,
+        peg$c107 = { type: "class", value: "[0-9]", description: "[0-9]" },
+        peg$c108 = "ply",
+        peg$c109 = { type: "literal", value: "ply", description: "\"ply\"" },
+        peg$c110 = { type: "other", description: "CallFn" },
+        peg$c111 = /^[a-zA-Z]/,
+        peg$c112 = { type: "class", value: "[a-zA-Z]", description: "[a-zA-Z]" },
+        peg$c113 = { type: "other", description: "Name" },
+        peg$c114 = /^[a-zA-Z_]/,
+        peg$c115 = { type: "class", value: "[a-zA-Z_]", description: "[a-zA-Z_]" },
+        peg$c116 = /^[a-z0-9A-Z_]/,
+        peg$c117 = { type: "class", value: "[a-z0-9A-Z_]", description: "[a-z0-9A-Z_]" },
+        peg$c118 = { type: "other", description: "TypeName" },
+        peg$c119 = /^[A-Z_\/]/,
+        peg$c120 = { type: "class", value: "[A-Z_/]", description: "[A-Z_/]" },
+        peg$c121 = { type: "other", description: "NotSQuote" },
+        peg$c122 = /^[^']/,
+        peg$c123 = { type: "class", value: "[^']", description: "[^']" },
+        peg$c124 = { type: "other", description: "NotDQuote" },
+        peg$c125 = /^[^"]/,
+        peg$c126 = { type: "class", value: "[^\"]", description: "[^\"]" },
+        peg$c127 = { type: "other", description: "Whitespace" },
+        peg$c128 = /^[ \t\r\n]/,
+        peg$c129 = { type: "class", value: "[ \\t\\r\\n]", description: "[ \\t\\r\\n]" },
 
         peg$currPos          = 0,
         peg$savedPos         = 0,
@@ -24385,8 +24639,292 @@ module.exports = function(plywood) {
               s1 = peg$c63(s1);
             }
             s0 = s1;
+            if (s0 === peg$FAILED) {
+              s0 = peg$currPos;
+              s1 = peg$parseStringSet();
+              if (s1 !== peg$FAILED) {
+                peg$savedPos = s0;
+                s1 = peg$c63(s1);
+              }
+              s0 = s1;
+              if (s0 === peg$FAILED) {
+                s0 = peg$currPos;
+                s1 = peg$parseNumberSet();
+                if (s1 !== peg$FAILED) {
+                  peg$savedPos = s0;
+                  s1 = peg$c63(s1);
+                }
+                s0 = s1;
+              }
+            }
           }
         }
+      }
+
+      return s0;
+    }
+
+    function peg$parseStringSet() {
+      var s0, s1, s2, s3, s4, s5, s6, s7, s8;
+
+      peg$silentFails++;
+      s0 = peg$currPos;
+      if (input.charCodeAt(peg$currPos) === 91) {
+        s1 = peg$c65;
+        peg$currPos++;
+      } else {
+        s1 = peg$FAILED;
+        if (peg$silentFails === 0) { peg$fail(peg$c66); }
+      }
+      if (s1 !== peg$FAILED) {
+        s2 = peg$parseStringOrNull();
+        if (s2 !== peg$FAILED) {
+          s3 = [];
+          s4 = peg$currPos;
+          s5 = peg$parse_();
+          if (s5 !== peg$FAILED) {
+            if (input.charCodeAt(peg$currPos) === 44) {
+              s6 = peg$c44;
+              peg$currPos++;
+            } else {
+              s6 = peg$FAILED;
+              if (peg$silentFails === 0) { peg$fail(peg$c45); }
+            }
+            if (s6 !== peg$FAILED) {
+              s7 = peg$parse_();
+              if (s7 !== peg$FAILED) {
+                s8 = peg$parseStringOrNull();
+                if (s8 !== peg$FAILED) {
+                  s5 = [s5, s6, s7, s8];
+                  s4 = s5;
+                } else {
+                  peg$currPos = s4;
+                  s4 = peg$FAILED;
+                }
+              } else {
+                peg$currPos = s4;
+                s4 = peg$FAILED;
+              }
+            } else {
+              peg$currPos = s4;
+              s4 = peg$FAILED;
+            }
+          } else {
+            peg$currPos = s4;
+            s4 = peg$FAILED;
+          }
+          while (s4 !== peg$FAILED) {
+            s3.push(s4);
+            s4 = peg$currPos;
+            s5 = peg$parse_();
+            if (s5 !== peg$FAILED) {
+              if (input.charCodeAt(peg$currPos) === 44) {
+                s6 = peg$c44;
+                peg$currPos++;
+              } else {
+                s6 = peg$FAILED;
+                if (peg$silentFails === 0) { peg$fail(peg$c45); }
+              }
+              if (s6 !== peg$FAILED) {
+                s7 = peg$parse_();
+                if (s7 !== peg$FAILED) {
+                  s8 = peg$parseStringOrNull();
+                  if (s8 !== peg$FAILED) {
+                    s5 = [s5, s6, s7, s8];
+                    s4 = s5;
+                  } else {
+                    peg$currPos = s4;
+                    s4 = peg$FAILED;
+                  }
+                } else {
+                  peg$currPos = s4;
+                  s4 = peg$FAILED;
+                }
+              } else {
+                peg$currPos = s4;
+                s4 = peg$FAILED;
+              }
+            } else {
+              peg$currPos = s4;
+              s4 = peg$FAILED;
+            }
+          }
+          if (s3 !== peg$FAILED) {
+            if (input.charCodeAt(peg$currPos) === 93) {
+              s4 = peg$c67;
+              peg$currPos++;
+            } else {
+              s4 = peg$FAILED;
+              if (peg$silentFails === 0) { peg$fail(peg$c68); }
+            }
+            if (s4 !== peg$FAILED) {
+              peg$savedPos = s0;
+              s1 = peg$c69(s2, s3);
+              s0 = s1;
+            } else {
+              peg$currPos = s0;
+              s0 = peg$FAILED;
+            }
+          } else {
+            peg$currPos = s0;
+            s0 = peg$FAILED;
+          }
+        } else {
+          peg$currPos = s0;
+          s0 = peg$FAILED;
+        }
+      } else {
+        peg$currPos = s0;
+        s0 = peg$FAILED;
+      }
+      peg$silentFails--;
+      if (s0 === peg$FAILED) {
+        s1 = peg$FAILED;
+        if (peg$silentFails === 0) { peg$fail(peg$c64); }
+      }
+
+      return s0;
+    }
+
+    function peg$parseStringOrNull() {
+      var s0;
+
+      s0 = peg$parseString();
+      if (s0 === peg$FAILED) {
+        s0 = peg$parseNullToken();
+      }
+
+      return s0;
+    }
+
+    function peg$parseNumberSet() {
+      var s0, s1, s2, s3, s4, s5, s6, s7, s8;
+
+      peg$silentFails++;
+      s0 = peg$currPos;
+      if (input.charCodeAt(peg$currPos) === 91) {
+        s1 = peg$c65;
+        peg$currPos++;
+      } else {
+        s1 = peg$FAILED;
+        if (peg$silentFails === 0) { peg$fail(peg$c66); }
+      }
+      if (s1 !== peg$FAILED) {
+        s2 = peg$parseNumberOrNull();
+        if (s2 !== peg$FAILED) {
+          s3 = [];
+          s4 = peg$currPos;
+          s5 = peg$parse_();
+          if (s5 !== peg$FAILED) {
+            if (input.charCodeAt(peg$currPos) === 44) {
+              s6 = peg$c44;
+              peg$currPos++;
+            } else {
+              s6 = peg$FAILED;
+              if (peg$silentFails === 0) { peg$fail(peg$c45); }
+            }
+            if (s6 !== peg$FAILED) {
+              s7 = peg$parse_();
+              if (s7 !== peg$FAILED) {
+                s8 = peg$parseNumberOrNull();
+                if (s8 !== peg$FAILED) {
+                  s5 = [s5, s6, s7, s8];
+                  s4 = s5;
+                } else {
+                  peg$currPos = s4;
+                  s4 = peg$FAILED;
+                }
+              } else {
+                peg$currPos = s4;
+                s4 = peg$FAILED;
+              }
+            } else {
+              peg$currPos = s4;
+              s4 = peg$FAILED;
+            }
+          } else {
+            peg$currPos = s4;
+            s4 = peg$FAILED;
+          }
+          while (s4 !== peg$FAILED) {
+            s3.push(s4);
+            s4 = peg$currPos;
+            s5 = peg$parse_();
+            if (s5 !== peg$FAILED) {
+              if (input.charCodeAt(peg$currPos) === 44) {
+                s6 = peg$c44;
+                peg$currPos++;
+              } else {
+                s6 = peg$FAILED;
+                if (peg$silentFails === 0) { peg$fail(peg$c45); }
+              }
+              if (s6 !== peg$FAILED) {
+                s7 = peg$parse_();
+                if (s7 !== peg$FAILED) {
+                  s8 = peg$parseNumberOrNull();
+                  if (s8 !== peg$FAILED) {
+                    s5 = [s5, s6, s7, s8];
+                    s4 = s5;
+                  } else {
+                    peg$currPos = s4;
+                    s4 = peg$FAILED;
+                  }
+                } else {
+                  peg$currPos = s4;
+                  s4 = peg$FAILED;
+                }
+              } else {
+                peg$currPos = s4;
+                s4 = peg$FAILED;
+              }
+            } else {
+              peg$currPos = s4;
+              s4 = peg$FAILED;
+            }
+          }
+          if (s3 !== peg$FAILED) {
+            if (input.charCodeAt(peg$currPos) === 93) {
+              s4 = peg$c67;
+              peg$currPos++;
+            } else {
+              s4 = peg$FAILED;
+              if (peg$silentFails === 0) { peg$fail(peg$c68); }
+            }
+            if (s4 !== peg$FAILED) {
+              peg$savedPos = s0;
+              s1 = peg$c69(s2, s3);
+              s0 = s1;
+            } else {
+              peg$currPos = s0;
+              s0 = peg$FAILED;
+            }
+          } else {
+            peg$currPos = s0;
+            s0 = peg$FAILED;
+          }
+        } else {
+          peg$currPos = s0;
+          s0 = peg$FAILED;
+        }
+      } else {
+        peg$currPos = s0;
+        s0 = peg$FAILED;
+      }
+      peg$silentFails--;
+      if (s0 === peg$FAILED) {
+        s1 = peg$FAILED;
+        if (peg$silentFails === 0) { peg$fail(peg$c70); }
+      }
+
+      return s0;
+    }
+
+    function peg$parseNumberOrNull() {
+      var s0;
+
+      s0 = peg$parseNumber();
+      if (s0 === peg$FAILED) {
+        s0 = peg$parseNullToken();
       }
 
       return s0;
@@ -24398,25 +24936,25 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       if (input.charCodeAt(peg$currPos) === 39) {
-        s1 = peg$c65;
+        s1 = peg$c72;
         peg$currPos++;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c66); }
+        if (peg$silentFails === 0) { peg$fail(peg$c73); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$parseNotSQuote();
         if (s2 !== peg$FAILED) {
           if (input.charCodeAt(peg$currPos) === 39) {
-            s3 = peg$c65;
+            s3 = peg$c72;
             peg$currPos++;
           } else {
             s3 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c66); }
+            if (peg$silentFails === 0) { peg$fail(peg$c73); }
           }
           if (s3 !== peg$FAILED) {
             peg$savedPos = s0;
-            s1 = peg$c67(s2);
+            s1 = peg$c74(s2);
             s0 = s1;
           } else {
             peg$currPos = s0;
@@ -24433,17 +24971,17 @@ module.exports = function(plywood) {
       if (s0 === peg$FAILED) {
         s0 = peg$currPos;
         if (input.charCodeAt(peg$currPos) === 39) {
-          s1 = peg$c65;
+          s1 = peg$c72;
           peg$currPos++;
         } else {
           s1 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c66); }
+          if (peg$silentFails === 0) { peg$fail(peg$c73); }
         }
         if (s1 !== peg$FAILED) {
           s2 = peg$parseNotSQuote();
           if (s2 !== peg$FAILED) {
             peg$savedPos = s0;
-            s1 = peg$c68(s2);
+            s1 = peg$c75(s2);
             s0 = s1;
           } else {
             peg$currPos = s0;
@@ -24456,25 +24994,25 @@ module.exports = function(plywood) {
         if (s0 === peg$FAILED) {
           s0 = peg$currPos;
           if (input.charCodeAt(peg$currPos) === 34) {
-            s1 = peg$c69;
+            s1 = peg$c76;
             peg$currPos++;
           } else {
             s1 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c70); }
+            if (peg$silentFails === 0) { peg$fail(peg$c77); }
           }
           if (s1 !== peg$FAILED) {
             s2 = peg$parseNotDQuote();
             if (s2 !== peg$FAILED) {
               if (input.charCodeAt(peg$currPos) === 34) {
-                s3 = peg$c69;
+                s3 = peg$c76;
                 peg$currPos++;
               } else {
                 s3 = peg$FAILED;
-                if (peg$silentFails === 0) { peg$fail(peg$c70); }
+                if (peg$silentFails === 0) { peg$fail(peg$c77); }
               }
               if (s3 !== peg$FAILED) {
                 peg$savedPos = s0;
-                s1 = peg$c67(s2);
+                s1 = peg$c74(s2);
                 s0 = s1;
               } else {
                 peg$currPos = s0;
@@ -24491,17 +25029,17 @@ module.exports = function(plywood) {
           if (s0 === peg$FAILED) {
             s0 = peg$currPos;
             if (input.charCodeAt(peg$currPos) === 34) {
-              s1 = peg$c69;
+              s1 = peg$c76;
               peg$currPos++;
             } else {
               s1 = peg$FAILED;
-              if (peg$silentFails === 0) { peg$fail(peg$c70); }
+              if (peg$silentFails === 0) { peg$fail(peg$c77); }
             }
             if (s1 !== peg$FAILED) {
               s2 = peg$parseNotDQuote();
               if (s2 !== peg$FAILED) {
                 peg$savedPos = s0;
-                s1 = peg$c71(s2);
+                s1 = peg$c78(s2);
                 s0 = s1;
               } else {
                 peg$currPos = s0;
@@ -24517,7 +25055,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c64); }
+        if (peg$silentFails === 0) { peg$fail(peg$c71); }
       }
 
       return s0;
@@ -24527,12 +25065,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 4) === peg$c72) {
-        s1 = peg$c72;
+      if (input.substr(peg$currPos, 4) === peg$c79) {
+        s1 = peg$c79;
         peg$currPos += 4;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c73); }
+        if (peg$silentFails === 0) { peg$fail(peg$c80); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24547,7 +25085,7 @@ module.exports = function(plywood) {
         }
         if (s2 !== peg$FAILED) {
           peg$savedPos = s0;
-          s1 = peg$c74();
+          s1 = peg$c81();
           s0 = s1;
         } else {
           peg$currPos = s0;
@@ -24565,12 +25103,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 5) === peg$c75) {
-        s1 = peg$c75;
+      if (input.substr(peg$currPos, 5) === peg$c82) {
+        s1 = peg$c82;
         peg$currPos += 5;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c76); }
+        if (peg$silentFails === 0) { peg$fail(peg$c83); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24585,7 +25123,7 @@ module.exports = function(plywood) {
         }
         if (s2 !== peg$FAILED) {
           peg$savedPos = s0;
-          s1 = peg$c77();
+          s1 = peg$c84();
           s0 = s1;
         } else {
           peg$currPos = s0;
@@ -24603,12 +25141,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 4) === peg$c78) {
-        s1 = peg$c78;
+      if (input.substr(peg$currPos, 4) === peg$c85) {
+        s1 = peg$c85;
         peg$currPos += 4;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c79); }
+        if (peg$silentFails === 0) { peg$fail(peg$c86); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24623,7 +25161,7 @@ module.exports = function(plywood) {
         }
         if (s2 !== peg$FAILED) {
           peg$savedPos = s0;
-          s1 = peg$c80();
+          s1 = peg$c87();
           s0 = s1;
         } else {
           peg$currPos = s0;
@@ -24641,12 +25179,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 3) === peg$c81) {
-        s1 = peg$c81;
+      if (input.substr(peg$currPos, 3) === peg$c88) {
+        s1 = peg$c88;
         peg$currPos += 3;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c82); }
+        if (peg$silentFails === 0) { peg$fail(peg$c89); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24678,12 +25216,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 3) === peg$c83) {
-        s1 = peg$c83;
+      if (input.substr(peg$currPos, 3) === peg$c90) {
+        s1 = peg$c90;
         peg$currPos += 3;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c84); }
+        if (peg$silentFails === 0) { peg$fail(peg$c91); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24715,12 +25253,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 2) === peg$c85) {
-        s1 = peg$c85;
+      if (input.substr(peg$currPos, 2) === peg$c92) {
+        s1 = peg$c92;
         peg$currPos += 2;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c86); }
+        if (peg$silentFails === 0) { peg$fail(peg$c93); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24752,12 +25290,12 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 2) === peg$c87) {
-        s1 = peg$c87;
+      if (input.substr(peg$currPos, 2) === peg$c94) {
+        s1 = peg$c94;
         peg$currPos += 2;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c88); }
+        if (peg$silentFails === 0) { peg$fail(peg$c95); }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
@@ -24788,12 +25326,12 @@ module.exports = function(plywood) {
     function peg$parseIdentifierPart() {
       var s0;
 
-      if (peg$c89.test(input.charAt(peg$currPos))) {
+      if (peg$c96.test(input.charAt(peg$currPos))) {
         s0 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s0 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c90); }
+        if (peg$silentFails === 0) { peg$fail(peg$c97); }
       }
 
       return s0;
@@ -24839,13 +25377,13 @@ module.exports = function(plywood) {
       }
       if (s1 !== peg$FAILED) {
         peg$savedPos = s0;
-        s1 = peg$c92(s1);
+        s1 = peg$c99(s1);
       }
       s0 = s1;
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c91); }
+        if (peg$silentFails === 0) { peg$fail(peg$c98); }
       }
 
       return s0;
@@ -24857,22 +25395,22 @@ module.exports = function(plywood) {
       s0 = peg$currPos;
       s1 = peg$currPos;
       if (input.charCodeAt(peg$currPos) === 45) {
-        s2 = peg$c93;
+        s2 = peg$c100;
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c94); }
+        if (peg$silentFails === 0) { peg$fail(peg$c101); }
       }
       if (s2 === peg$FAILED) {
         s2 = null;
       }
       if (s2 !== peg$FAILED) {
-        if (peg$c95.test(input.charAt(peg$currPos))) {
+        if (peg$c102.test(input.charAt(peg$currPos))) {
           s3 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s3 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c96); }
+          if (peg$silentFails === 0) { peg$fail(peg$c103); }
         }
         if (s3 !== peg$FAILED) {
           s4 = peg$parseDigits();
@@ -24900,11 +25438,11 @@ module.exports = function(plywood) {
         s0 = peg$currPos;
         s1 = peg$currPos;
         if (input.charCodeAt(peg$currPos) === 45) {
-          s2 = peg$c93;
+          s2 = peg$c100;
           peg$currPos++;
         } else {
           s2 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c94); }
+          if (peg$silentFails === 0) { peg$fail(peg$c101); }
         }
         if (s2 === peg$FAILED) {
           s2 = null;
@@ -24971,12 +25509,12 @@ module.exports = function(plywood) {
 
       s0 = peg$currPos;
       s1 = peg$currPos;
-      if (input.substr(peg$currPos, 1).toLowerCase() === peg$c97) {
+      if (input.substr(peg$currPos, 1).toLowerCase() === peg$c104) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c98); }
+        if (peg$silentFails === 0) { peg$fail(peg$c105); }
       }
       if (s2 !== peg$FAILED) {
         if (peg$c28.test(input.charAt(peg$currPos))) {
@@ -25041,12 +25579,12 @@ module.exports = function(plywood) {
     function peg$parseDigit() {
       var s0;
 
-      if (peg$c99.test(input.charAt(peg$currPos))) {
+      if (peg$c106.test(input.charAt(peg$currPos))) {
         s0 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s0 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c100); }
+        if (peg$silentFails === 0) { peg$fail(peg$c107); }
       }
 
       return s0;
@@ -25056,40 +25594,40 @@ module.exports = function(plywood) {
       var s0, s1, s2, s3;
 
       s0 = peg$currPos;
-      if (input.substr(peg$currPos, 3) === peg$c101) {
-        s1 = peg$c101;
+      if (input.substr(peg$currPos, 3) === peg$c108) {
+        s1 = peg$c108;
         peg$currPos += 3;
       } else {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c102); }
+        if (peg$silentFails === 0) { peg$fail(peg$c109); }
       }
       if (s1 === peg$FAILED) {
-        if (input.substr(peg$currPos, 5) === peg$c75) {
-          s1 = peg$c75;
+        if (input.substr(peg$currPos, 5) === peg$c82) {
+          s1 = peg$c82;
           peg$currPos += 5;
         } else {
           s1 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c76); }
+          if (peg$silentFails === 0) { peg$fail(peg$c83); }
         }
         if (s1 === peg$FAILED) {
-          if (input.substr(peg$currPos, 4) === peg$c78) {
-            s1 = peg$c78;
+          if (input.substr(peg$currPos, 4) === peg$c85) {
+            s1 = peg$c85;
             peg$currPos += 4;
           } else {
             s1 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c79); }
+            if (peg$silentFails === 0) { peg$fail(peg$c86); }
           }
         }
       }
       if (s1 !== peg$FAILED) {
         s2 = peg$currPos;
         peg$silentFails++;
-        if (peg$c89.test(input.charAt(peg$currPos))) {
+        if (peg$c96.test(input.charAt(peg$currPos))) {
           s3 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s3 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c90); }
+          if (peg$silentFails === 0) { peg$fail(peg$c97); }
         }
         peg$silentFails--;
         if (s3 === peg$FAILED) {
@@ -25119,22 +25657,22 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       s1 = [];
-      if (peg$c104.test(input.charAt(peg$currPos))) {
+      if (peg$c111.test(input.charAt(peg$currPos))) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c105); }
+        if (peg$silentFails === 0) { peg$fail(peg$c112); }
       }
       if (s2 !== peg$FAILED) {
         while (s2 !== peg$FAILED) {
           s1.push(s2);
-          if (peg$c104.test(input.charAt(peg$currPos))) {
+          if (peg$c111.test(input.charAt(peg$currPos))) {
             s2 = input.charAt(peg$currPos);
             peg$currPos++;
           } else {
             s2 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c105); }
+            if (peg$silentFails === 0) { peg$fail(peg$c112); }
           }
         }
       } else {
@@ -25148,7 +25686,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c103); }
+        if (peg$silentFails === 0) { peg$fail(peg$c110); }
       }
 
       return s0;
@@ -25171,30 +25709,30 @@ module.exports = function(plywood) {
         s2 = peg$FAILED;
       }
       if (s2 !== peg$FAILED) {
-        if (peg$c107.test(input.charAt(peg$currPos))) {
+        if (peg$c114.test(input.charAt(peg$currPos))) {
           s3 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s3 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c108); }
+          if (peg$silentFails === 0) { peg$fail(peg$c115); }
         }
         if (s3 !== peg$FAILED) {
           s4 = [];
-          if (peg$c109.test(input.charAt(peg$currPos))) {
+          if (peg$c116.test(input.charAt(peg$currPos))) {
             s5 = input.charAt(peg$currPos);
             peg$currPos++;
           } else {
             s5 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c110); }
+            if (peg$silentFails === 0) { peg$fail(peg$c117); }
           }
           while (s5 !== peg$FAILED) {
             s4.push(s5);
-            if (peg$c109.test(input.charAt(peg$currPos))) {
+            if (peg$c116.test(input.charAt(peg$currPos))) {
               s5 = input.charAt(peg$currPos);
               peg$currPos++;
             } else {
               s5 = peg$FAILED;
-              if (peg$silentFails === 0) { peg$fail(peg$c110); }
+              if (peg$silentFails === 0) { peg$fail(peg$c117); }
             }
           }
           if (s4 !== peg$FAILED) {
@@ -25220,7 +25758,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c106); }
+        if (peg$silentFails === 0) { peg$fail(peg$c113); }
       }
 
       return s0;
@@ -25232,22 +25770,22 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       s1 = [];
-      if (peg$c112.test(input.charAt(peg$currPos))) {
+      if (peg$c119.test(input.charAt(peg$currPos))) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c113); }
+        if (peg$silentFails === 0) { peg$fail(peg$c120); }
       }
       if (s2 !== peg$FAILED) {
         while (s2 !== peg$FAILED) {
           s1.push(s2);
-          if (peg$c112.test(input.charAt(peg$currPos))) {
+          if (peg$c119.test(input.charAt(peg$currPos))) {
             s2 = input.charAt(peg$currPos);
             peg$currPos++;
           } else {
             s2 = peg$FAILED;
-            if (peg$silentFails === 0) { peg$fail(peg$c113); }
+            if (peg$silentFails === 0) { peg$fail(peg$c120); }
           }
         }
       } else {
@@ -25261,7 +25799,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c111); }
+        if (peg$silentFails === 0) { peg$fail(peg$c118); }
       }
 
       return s0;
@@ -25273,21 +25811,21 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       s1 = [];
-      if (peg$c115.test(input.charAt(peg$currPos))) {
+      if (peg$c122.test(input.charAt(peg$currPos))) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c116); }
+        if (peg$silentFails === 0) { peg$fail(peg$c123); }
       }
       while (s2 !== peg$FAILED) {
         s1.push(s2);
-        if (peg$c115.test(input.charAt(peg$currPos))) {
+        if (peg$c122.test(input.charAt(peg$currPos))) {
           s2 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s2 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c116); }
+          if (peg$silentFails === 0) { peg$fail(peg$c123); }
         }
       }
       if (s1 !== peg$FAILED) {
@@ -25298,7 +25836,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c114); }
+        if (peg$silentFails === 0) { peg$fail(peg$c121); }
       }
 
       return s0;
@@ -25310,21 +25848,21 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       s1 = [];
-      if (peg$c118.test(input.charAt(peg$currPos))) {
+      if (peg$c125.test(input.charAt(peg$currPos))) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c119); }
+        if (peg$silentFails === 0) { peg$fail(peg$c126); }
       }
       while (s2 !== peg$FAILED) {
         s1.push(s2);
-        if (peg$c118.test(input.charAt(peg$currPos))) {
+        if (peg$c125.test(input.charAt(peg$currPos))) {
           s2 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s2 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c119); }
+          if (peg$silentFails === 0) { peg$fail(peg$c126); }
         }
       }
       if (s1 !== peg$FAILED) {
@@ -25335,7 +25873,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c117); }
+        if (peg$silentFails === 0) { peg$fail(peg$c124); }
       }
 
       return s0;
@@ -25347,21 +25885,21 @@ module.exports = function(plywood) {
       peg$silentFails++;
       s0 = peg$currPos;
       s1 = [];
-      if (peg$c121.test(input.charAt(peg$currPos))) {
+      if (peg$c128.test(input.charAt(peg$currPos))) {
         s2 = input.charAt(peg$currPos);
         peg$currPos++;
       } else {
         s2 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c122); }
+        if (peg$silentFails === 0) { peg$fail(peg$c129); }
       }
       while (s2 !== peg$FAILED) {
         s1.push(s2);
-        if (peg$c121.test(input.charAt(peg$currPos))) {
+        if (peg$c128.test(input.charAt(peg$currPos))) {
           s2 = input.charAt(peg$currPos);
           peg$currPos++;
         } else {
           s2 = peg$FAILED;
-          if (peg$silentFails === 0) { peg$fail(peg$c122); }
+          if (peg$silentFails === 0) { peg$fail(peg$c129); }
         }
       }
       if (s1 !== peg$FAILED) {
@@ -25372,7 +25910,7 @@ module.exports = function(plywood) {
       peg$silentFails--;
       if (s0 === peg$FAILED) {
         s1 = peg$FAILED;
-        if (peg$silentFails === 0) { peg$fail(peg$c120); }
+        if (peg$silentFails === 0) { peg$fail(peg$c127); }
       }
 
       return s0;
@@ -25385,6 +25923,7 @@ module.exports = function(plywood) {
     var Expression = plywood.Expression;
     var LiteralExpression = plywood.LiteralExpression;
     var RefExpression = plywood.RefExpression;
+    var Set = plywood.Set;
 
     var possibleCalls = {
       'is': 1,
@@ -25417,6 +25956,10 @@ module.exports = function(plywood) {
       'quantile': 1,
       'split': 1
     };
+
+    function makeListMap3(head, tail) {
+      return [head].concat(tail.map(function(t) { return t[3] }));
+    }
 
     function naryExpressionFactory(op, head, tail) {
       if (!tail.length) return head;
